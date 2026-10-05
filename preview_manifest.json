@@ -1,12 +1,14 @@
 {
   "schema": "fvp-gui-public-preview/1",
   "date": "2026-10-05",
-  "backend_included": false,
+  "backend_included": true,
   "upload_ready": true,
-  "package_scope": "gui_preview_only",
+  "package_scope": "gui_and_early_backend",
   "repository_visibility": "private",
   "license": "GPL-3.0-or-later",
-  "backend_publication_audit_complete": false,
+  "backend_publication_audit_complete": true,
+  "backend_version": "0.2.1",
+  "requires_private_configuration": ["sources", "engine_recognition_signatures", "hoshi_connection_for_hoshi_export"],
   "source_gui_sha256": "ebbd1bae6680e865b3fdf26b29532662bc852e7648d14b3c20ee064407c21763",
   "preview_gui_sha256": "84b7da73fd98055ea559497b3c4b470b1c3956fe7965d0bd432c174b6c3915e0",
   "css_unchanged": true,
@@ -23,7 +25,6 @@
     "built_in_story_example_replaced_with_blank_project",
     "add_GPL_3_or_later_license_notice"
   ],
-  "deferred_components": [
-    "native_backend_pending_source_and_resource_audit"
-  ]
+  "test_games_included": false,
+  "full_FVP_feature_coverage": false
 }

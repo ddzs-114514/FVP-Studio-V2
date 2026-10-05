@@ -1,0 +1,3 @@
+# Resource preview/build and independent-copy process safety.
+Pillow>=10.0
+psutil>=5.9

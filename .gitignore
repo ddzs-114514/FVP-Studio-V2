@@ -1,6 +1,11 @@
 # Private local registrations and credentials are never tracked.
 sources.json
 sources.local.json
+*.local.json
+local-workspace/
+*.egg-info/
+build/
+dist/
 .env
 .env.*
 credentials*.json
