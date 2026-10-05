@@ -1,0 +1,29 @@
+{
+  "schema": "fvp-gui-public-preview/1",
+  "date": "2026-10-05",
+  "backend_included": false,
+  "upload_ready": true,
+  "package_scope": "gui_preview_only",
+  "repository_visibility": "private",
+  "license": "GPL-3.0-or-later",
+  "backend_publication_audit_complete": false,
+  "source_gui_sha256": "ebbd1bae6680e865b3fdf26b29532662bc852e7648d14b3c20ee064407c21763",
+  "preview_gui_sha256": "84b7da73fd98055ea559497b3c4b470b1c3956fe7965d0bd432c174b6c3915e0",
+  "css_unchanged": true,
+  "changes": [
+    "remove_embedded_real_asset_project",
+    "real_sample_menu_uses_blank_project",
+    "remove_three_machine_path_defaults",
+    "cast_examples_use_synthetic_labels_and_metadata",
+    "asset_examples_reference_only_programmatic_diagrams",
+    "replace_real_sample_description",
+    "replace_demo_narration",
+    "replace_demo_dialogue",
+    "replace_demo_choice_labels",
+    "built_in_story_example_replaced_with_blank_project",
+    "add_GPL_3_or_later_license_notice"
+  ],
+  "deferred_components": [
+    "native_backend_pending_source_and_resource_audit"
+  ]
+}

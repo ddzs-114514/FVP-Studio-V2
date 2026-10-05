@@ -1,0 +1,43 @@
+{
+  "schema": "fvp-story-studio-project/1",
+  "project": {
+    "title": "空白示例",
+    "source": "hoshi",
+    "nextSerial": 2,
+    "cgTestSceneId": null,
+    "cast": [],
+    "chapters": [
+      {
+        "id": "ch1",
+        "title": "第一章",
+        "scenes": [
+          "story-scene-0001"
+        ]
+      }
+    ],
+    "scenes": {
+      "story-scene-0001": {
+        "id": "story-scene-0001",
+        "title": "新场景",
+        "anchor": null,
+        "setup": {
+          "bg": null,
+          "cg": null
+        },
+        "actors": [],
+        "beats": [
+          {
+            "id": "b1",
+            "kind": "line",
+            "speaker": "narration",
+            "text": "",
+            "actions": []
+          }
+        ],
+        "exit": {
+          "type": "end"
+        }
+      }
+    }
+  }
+}

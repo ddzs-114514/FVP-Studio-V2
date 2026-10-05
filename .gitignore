@@ -1,0 +1,36 @@
+# Private local registrations and credentials are never tracked.
+sources.json
+sources.local.json
+.env
+.env.*
+credentials*.json
+*.pem
+*.key
+
+# No games, original resources, generated test copies or media.
+*.hcb
+*.bch
+*.bin
+*.exe
+*.dll
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.wav
+*.ogg
+*.mp3
+*.mp4
+*.zip
+*.7z
+
+# Local tooling and generated files.
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+cache/
+work/
+test_games/
+*.log

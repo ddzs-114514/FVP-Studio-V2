@@ -1,0 +1,3 @@
+# Dependency inventory for the pending backend publication; not a complete bundle.
+Pillow>=10.0
+psutil>=5.9
