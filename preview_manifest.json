@@ -4,7 +4,7 @@
   "backend_included": true,
   "upload_ready": true,
   "package_scope": "gui_and_early_backend",
-  "repository_visibility": "private",
+  "repository_visibility": "public",
   "license": "GPL-3.0-or-later",
   "backend_publication_audit_complete": true,
   "backend_version": "0.2.1",
