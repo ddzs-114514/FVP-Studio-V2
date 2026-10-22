@@ -48,6 +48,12 @@ class PreflightRuntime(GuiRuntime):
             swap_blend=True, swap_default_duration_ms=SWAP_DEFAULT_DURATION_MS,
             swap_legacy_duration_ms=0, swap_blend_max_duration_ms=6000,
             swap_whole_body_and_expression=True, swap_same_actor_alpha_overlap=False,
+            swap_expression_field="expr", swap_default_expression=0,
+            swap_default_expression_basis="destination_first_frame",
+            same_beat_swap_expression_fused=True, swap_expression_duration_policy="max",
+            same_beat_swap_alpha_fused=True, swap_alpha_duration_policy='max',
+            swap_alpha_event_field='target_alpha', swap_alpha_actions=['fade', 'enter_fade', 'exit_fade', 'enter_slide', 'exit_slide'],
+            same_beat_swap_fade_entry_exit_fused=True, swap_slide_fusion=True,
             move_after_scale=True, simultaneous_scale_move=False,
             simultaneous_depth_move=False, native_import_size_unchanged=True,
             runtime_verified=False)

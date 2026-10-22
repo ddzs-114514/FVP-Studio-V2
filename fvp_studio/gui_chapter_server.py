@@ -2,7 +2,7 @@
 import argparse
 import json
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .gui_audio_server import AudioRuntime, GuiAudioHandler, GuiAudioServer
 from .gui_chapter import MAX_SCENES, chapter_plan
@@ -16,6 +16,12 @@ PLAN_REQUEST_SCHEMA = "fvp-gui-chapter-plan-request/1"
 
 
 class ChapterRuntime(AudioRuntime):
+    def chapter_transitions(self):
+        from .gui_chapter_transition import ChapterTransitionCatalog
+        if not hasattr(self, "_chapter_transitions"):
+            self._chapter_transitions = ChapterTransitionCatalog(self)
+        return self._chapter_transitions
+
     def health(self):
         result = super().health()
         result["capabilities"].update(chapter_plan=True, chapter_export=True,
@@ -27,6 +33,8 @@ class ChapterRuntime(AudioRuntime):
             cross_chapter_routes=True, next_is_chapter_local=True,
             scene_setup_reset=True, audio_preserved_between_scenes=True,
             original_game_read_only=True, launch_game=False, runtime_verified=False)
+        from .gui_chapter_transition import contract
+        result["chapter_export_contract"]["transitions"] = contract()
         result["story_logic_contract"] = dict(schema=STORY_CONTRACT, target="hoshi",
             project_field="variables", beat_field="effects", choice_option_field="effects",
             variable_types=["bool", "int"], max_variables=MAX_VARIABLES,
@@ -67,6 +75,30 @@ class GuiChapterHandler(GuiAudioHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
+        if url.path in {API_ROOT+"chapter-transition-catalog", API_ROOT+"chapter-transition-mask"}:
+            try:
+                from .gui_target_selection import OPTION_FIELDS
+                self._local_request()
+                query = parse_qs(url.query, keep_blank_values=True)
+                image = url.path.endswith("-mask")
+                required = {"source", "mask"} if image else {"source"}
+                if (len(self.path) > 2048 or not required <= set(query)
+                        or set(query)-required-set(OPTION_FIELDS) or any(len(v) != 1 or not v[0] for v in query.values())):
+                    raise ValueError("转场目录请求不正确。")
+                source = query.pop("source")[0]
+                mask = query.pop("mask")[0] if image else None
+                options = {k: v[0] for k, v in query.items()}
+                catalog = self.server.runtime.chapter_transitions()
+                if image:
+                    payload, digest = catalog.preview(source, mask, **options)
+                    self._send(200, payload, "image/png", digest)
+                else:
+                    self._json(catalog.info(source, **options))
+            except GuiRuntimeError as exc:
+                self._error(exc)
+            except (ValueError, KeyError, TypeError, OSError) as exc:
+                self._error(GuiRuntimeError("transition_unavailable", str(exc)[:300], 422))
+            return
         prefix = API_ROOT + "chapter-export/"
         if not url.path.startswith(prefix):
             return super().do_GET()

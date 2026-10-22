@@ -20,7 +20,7 @@ BASE_KINDS = {"GuiChoice": "Choice", "GuiChoiceCase": "ChoiceCase", "GuiChoiceEn
 BRANCH_EVENTS = BRANCH_KINDS | {"Portrait", "Hide", "Background", "Transition"} | BG_KINDS | BLUR_KINDS
 
 
-def event_values(kind, fields):
+def event_values(kind, fields, *, encoding="gbk"):
     base = BASE_KINDS.get(kind)
     if base is None:
         raise ValueError("未知分支轨道事件")
@@ -30,7 +30,7 @@ def event_values(kind, fields):
         raise ValueError("分支轨道缺少出口或轨道 ID")
     result = values(base, {k: v for k, v in fields.items() if k not in extras})
     if kind == "GuiChoice":
-        choice_options(result)
+        choice_options(result, encoding=encoding)
         mode, target = fields["completion"], fields["merge_beat_id"]
         if mode not in ("merge", "end"):
             raise ValueError("分支出口须明确汇合或结束场景")
@@ -48,21 +48,21 @@ def event_values(kind, fields):
     return result
 
 
-def base_event(event):
+def base_event(event, *, encoding="gbk"):
     """Closed type check, then drop only GUI control-flow metadata."""
     kind = event["kind"]
-    parsed = event_values(kind, {k: v for k, v in event.items() if k != "kind"})
+    parsed = event_values(kind, {k: v for k, v in event.items() if k != "kind"}, encoding=encoding)
     extras = {"completion", "merge_beat_id", "track_id"}
     return {"kind": BASE_KINDS[kind], **{k: v for k, v in parsed.items() if k not in extras}}
 
 
-def validate_track_structure(events):
+def validate_track_structure(events, *, encoding="gbk"):
     """Also guard raw typed programs, not just SceneBuilder output."""
     active, track_ids = None, set()
     for index, event in enumerate(events):
         kind = event["kind"]
         if kind in KINDS:
-            event_values(kind, {k: v for k, v in event.items() if k != "kind"})
+            event_values(kind, {k: v for k, v in event.items() if k != "kind"}, encoding=encoding)
         if kind == "GuiChoice":
             if active is not None:
                 raise ValueError("本轮不支持分支内再嵌套选项")

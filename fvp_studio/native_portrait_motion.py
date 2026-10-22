@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 import math
+import struct
 from types import MappingProxyType
 
 from .hoshimemo_scene_hook import _call
 from .native_call_flow import NativeFunctionFlow
+from .native_background_backend import _literal
 from .native_portrait_acceptance import NativePortraitAcceptanceError, _function_spans
 from .native_script_state import NativeScriptStateClosure, validate_native_script_pair
 from .native_stage_motion import _SemanticImage
@@ -24,6 +26,22 @@ from .portrait_emitter import _encode_push
 SCHEMA = "fvp-native-portrait-motion-flow/1"
 ROLES = {"xy": ("MotionMove", 8, 5), "z": ("MotionMoveZ", 6, 3),
          "s2": ("MotionMoveS2", 8, 5), "r": ("MotionMoveR", 6, 3)}
+
+
+def _converted_coordinate(value, factor):
+    """Invert this target's f32 multiply/truncate without a 1-pixel jump."""
+    if (type(value) is not int or not -2**31 <= value < 2**31
+            or type(factor) not in (int, float) or not math.isfinite(factor) or factor <= 0):
+        raise NativePortraitAcceptanceError("角色运动坐标或目标原生换算系数无效。")
+    logical = (value + math.copysign(.5, value)) / factor if value else 0.0
+    try:
+        encoded = struct.unpack("<f", struct.pack("<f", logical))[0]
+        native = struct.unpack("<f", struct.pack("<f", encoded * factor))[0]
+    except (OverflowError, struct.error) as exc:
+        raise NativePortraitAcceptanceError("角色运动坐标超出目标原生浮点换算范围。") from exc
+    if not math.isfinite(native) or int(native) != value or int(encoded * factor) != value:
+        raise NativePortraitAcceptanceError("角色运动坐标超出目标原生浮点换算范围。")
+    return encoded
 
 
 def _argument(index):
@@ -142,6 +160,8 @@ class NativePortraitMotion:
         closure = NativeScriptStateClosure(source, analysis, roots, runtime_context=runtime_context,
                                           max_functions=128, max_instructions=32768)
         self.global_ids = closure.global_ids
+        self.analysis = analysis
+        self._nil_flag_proofs = {}
         self._bindings = bindings
         conversion = proofs.get("xy", {}).get("xy_conversion")
         self.xy_converted = conversion is not None
@@ -153,7 +173,56 @@ class NativePortraitMotion:
             cross_game_reference_required=False, primitive_ownership_granted=False,
             rotation_degrees_conversion_proven=False, game_name_switch_used=False, runtime_verified=False)
 
-    def compile(self, channel, primitive_operand, values):
+    def prove_nil_flag(self, channel):
+        """CG's existing native calls use typed Nil for the timing option."""
+        if channel not in self._bindings:
+            raise NativePortraitAcceptanceError("动作缺少已经绑定的通道。")
+        if channel in self._nil_flag_proofs:
+            return deepcopy(self._nil_flag_proofs[channel])
+        address, count, tail = self._bindings[channel]
+        trace = NativeFunctionFlow(self.analysis).trace(address,
+            literal_arguments={count:tail[0], count-1:None},
+            non_nil_arguments=range(count-1), max_instructions=2048, max_joined_values=128)
+        calls = trace.get("calls", ())
+        if trace["status"] != "proven_static_argument_flow" or len(calls) != 1:
+            raise NativePortraitAcceptanceError("目标的原生空选项动作参数尚未确定。")
+        arguments = deepcopy(calls[0]["arguments"])
+        if not arguments or arguments[-1] != _literal(None):
+            raise NativePortraitAcceptanceError("目标改变了原生动作的空选项。")
+        arguments[-1] = _argument(count-1)
+        if not _direct_arguments(arguments, count, ROLES[channel][2]):
+            raise NativePortraitAcceptanceError("目标的原生空选项动作参数未保持原顺序。")
+        self._nil_flag_proofs[channel] = trace
+        return deepcopy(trace)
+
+    def prove_current_rotation(self):
+        """Typed Nil must survive the R wrapper, not turn into zero.
+
+        NativeRotationDegrees separately binds the executable current-R read.
+        This proves the script half of that same target-specific path.
+        """
+        if 'r' not in self._bindings:
+            raise NativePortraitAcceptanceError('尚未绑定原生旋转通道。')
+        if hasattr(self, '_current_rotation_proof'):
+            return deepcopy(self._current_rotation_proof)
+        address, count, tail = self._bindings['r']
+        trace = NativeFunctionFlow(self.analysis).trace(address,
+            literal_arguments={count: tail[0], 1: None},
+            non_nil_arguments=[i for i in range(count) if i != 1],
+            max_instructions=2048, max_joined_values=128)
+        calls = trace.get('calls', ())
+        if trace['status'] != 'proven_static_argument_flow' or len(calls) != 1:
+            raise NativePortraitAcceptanceError('原生旋转的当前角度参数路径尚未确定。')
+        args = deepcopy(calls[0]['arguments'])
+        if len(args) != count or args[1] != _literal(None):
+            raise NativePortraitAcceptanceError('原生旋转包装改变了当前角度 Nil 参数。')
+        args[1] = _argument(1)
+        if not _direct_arguments(args, count, ROLES['r'][2]):
+            raise NativePortraitAcceptanceError('原生旋转当前角度路径改变了其他参数。')
+        self._current_rotation_proof = trace
+        return deepcopy(trace)
+
+    def compile(self, channel, primitive_operand, values, *, allow_nil_flag=False, allow_current_rotation=False):
         if channel not in self._bindings or type(primitive_operand) is not bytes or not primitive_operand:
             raise NativePortraitAcceptanceError("动作缺少已经绑定的通道或图元。")
         address, count, tail = self._bindings[channel]
@@ -165,8 +234,12 @@ class NativePortraitMotion:
         if type(values[duration + 1]) is not int:
             raise NativePortraitAcceptanceError("动作曲线必须保留其原生整数类型。")
         for index, value in enumerate(values):
-            if index == count - 2:
-                if type(value) is not bool:
+            if index == 0 and value is None and channel == 'r' and allow_current_rotation is True:
+                self.prove_current_rotation()
+            elif index == count - 2:
+                if value is None and allow_nil_flag is True:
+                    self.prove_nil_flag(channel)
+                elif type(value) is not bool:
                     raise NativePortraitAcceptanceError("动作原生选项必须保留其布尔类型。")
             elif (type(value) not in (int, float) or not math.isfinite(value)
                   or type(value) is int and not -2**31 <= value < 2**31

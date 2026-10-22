@@ -15,7 +15,7 @@ CHOICE_KINDS = {"Choice", "ChoiceCase", "ChoiceEnd"}
 BRANCH_KINDS = {"Text", "Speech", "Dialogue", "Wait", "Action", "Camera", "CameraShot", "CameraNative", "CGAction"}
 
 
-def choice_options(event):
+def choice_options(event, *, encoding="gbk"):
     options = [event[f"option_{i}"] for i in range(1, 5)]
     while options and not options[-1].strip():
         options.pop()
@@ -26,11 +26,12 @@ def choice_options(event):
     for text in [event["prompt"], *options]:
         if not text.strip():
             raise ValueError("选项提示不能留空")
-        _encode_push(text, "gbk")
+        if encoding is not None:
+            _encode_push(text, encoding)
     return options
 
 
-def validate_choices(events, *, partial=False, branch_kinds=None):
+def validate_choices(events, *, partial=False, branch_kinds=None, encoding="gbk"):
     # Only a separately typed GUI bridge may supply its broader beat set.
     # Ordinary Comfy/production programs keep the original restricted contract.
     allowed = BRANCH_KINDS if branch_kinds is None else branch_kinds
@@ -42,7 +43,7 @@ def validate_choices(events, *, partial=False, branch_kinds=None):
             if active or ident in used or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", ident):
                 raise ValueError("选项 ID 必须唯一；首版不支持嵌套选项")
             used.add(ident)
-            active, count = (ident, len(choice_options(event))), 0
+            active, count = (ident, len(choice_options(event, encoding=encoding))), 0
         elif kind in ("ChoiceCase", "ChoiceEnd"):
             if not active or event["choice_id"] != active[0]:
                 raise ValueError("分支 / 汇合节点的选项 ID 与当前选项不一致")

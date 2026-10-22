@@ -1,0 +1,18 @@
+原作 HCB 逐句调用表工具
+
+运行入口：python -m fvp_studio.original_call_table --help
+
+示例（尖括号内容需替换成本机有权使用的文件，不是仓库附带资源）：
+python -m fvp_studio.original_call_table --hcb "<原作 HCB 文件>" --encoding cp932 --output "local-workspace/original-call-tables"
+
+输出必须是游戏目录之外的新目录，不覆盖既有输出。工具只读取原作，不执行游戏、不修改 HCB/EXE/BIN。可使用 --translation-hcb 与 --translation-encoding 添加有权使用的本机文本对照。
+
+自动识别无法唯一确认当前 HCB 的台词函数时，可以显式提供独立核对的 --print-target、--wait-target，或 --print-includes-wait。不能按其他游戏的函数名或编号套用。
+
+导出按原始源码地址组织直接调用、函数内部调用、逐句区间及已知参数；不能把它当作游戏实际运行轨迹。分支、循环和线程不展开为必然游玩顺序；无法解析的值保留 unknown 或符号值。
+
+函数序号、偏移和文本只属于本次输入及其摘要。没有说话人调用，不会自动猜成旁白；不会按语音文件名猜角色或语义。
+
+输出可能包含受版权保护的原文、输入路径及本机版本信息，仅供本机分析使用。不要提交输出目录、JSONL、台词表或原作样本。仓库发布的是自作工具及本说明，不含任何原作调用表导出数据。
+
+本工具的解析和合成检查不是游戏执行、听感、存读档或回溯验收。

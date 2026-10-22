@@ -15,7 +15,7 @@ KIND = "GuiVoiceLine"
 CONTRACT = "fvp-gui-voice-line/1"
 
 
-def event_values(fields):
+def event_values(fields, *, encoding="gbk"):
     required = {"line_id", "text", "speaker_mode", "display_name", "source", "archive", "resource", "sha256", "volume"}
     if set(fields) not in (required, required | {"speaker_source"}):
         raise ValueError("配音台词字段不完整。")
@@ -36,8 +36,9 @@ def event_values(fields):
             or not SHA_RE.fullmatch(fields["sha256"]) or type(fields["volume"]) is not int
             or not 0 <= fields["volume"] <= 100):
         raise ValueError("配音素材引用或音量不正确。")
-    _encode_push(fields["text"], "gbk")
-    _encode_push(name, "gbk")
+    if encoding is not None:
+        _encode_push(fields["text"], encoding)
+        _encode_push(name, encoding)
     return deepcopy(fields)
 
 

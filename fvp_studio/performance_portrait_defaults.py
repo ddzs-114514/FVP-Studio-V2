@@ -25,6 +25,7 @@ from .performance_portrait_limits import (
 from .native_import_size_discovery import (
     discover_source_root, select_body_size_rule,
 )
+from .native_import_position import NativePositionError, source_native_position
 
 
 _HOSHIMEMO_PROFILE = next(
@@ -509,16 +510,36 @@ def _discovered_native_default(event, archive, common, metadata, alpha, archive_
     archive_sha = _cached_sha256(str(archive), archive_fingerprint)
     if _fingerprint(archive) != archive_fingerprint:
         raise ValueError("来源立绘档案在解析期间变化，拒绝沿用大小证据")
-    # Placement is explicitly an editable authoring default, NOT original XY.
-    # Existing authored nodes are not changed by this import-only resolver.
+    # New imports derive their bottom anchor from the source OP/default XY and
+    # HZC crop, using precisely the approved neutral-size basis. Existing
+    # projects and authored X remain untouched. Missing placement evidence must
+    # not masquerade as source coordinates or change the proven source size.
+    try:
+        position = source_native_position(proof, common["body"], form, metadata)
+        bottom_y = position["bottom_y"]
+        if not -720 <= bottom_y <= 1800:
+            raise NativePositionError("换算站位超出当前创作坐标范围，需单独设置")
+        placement_notice = ("站位已按原作原点、默认 Y 与素材裁切偏移换算；"
+                            "横向位置仍由作者编排，可单独调整。")
+    except NativePositionError as exc:
+        bottom_y = _GENERIC_BOTTOM_Y
+        position = dict(schema="fvp-native-import-position/1", verified=False,
+            body=common["body"], body_sha256=metadata["payload_sha256"],
+            bottom_y=bottom_y, coordinate_policy="unresolved-authoring-default",
+            x_policy="author-selected-horizontal-position", coordinates_editable=True,
+            reason=str(exc), uses_story_camera=False, uses_face_matching=False,
+            size_changed=False, runtime_visual_verified=False)
+        placement_notice = f"站位尚未解析：{exc}；Y={bottom_y} 只是可调整的创作初值，不是原作站位。"
     return {
         "kind": "Portrait",
         "values": {**common, "stage_x": _integer(event.get("stage_x", 640),
                                                 "stage_x", -640, 1920),
-                   "bottom_y": _GENERIC_BOTTOM_Y, "height": height,
+                   "bottom_y": bottom_y, "height": height,
                    "depth": _GENERIC_REFERENCE_DEPTH, "alpha": alpha},
         "source_form_verified": True, "source_size_rule_verified": True,
         "native_size_verified": False,
+        "source_position_verified": position["verified"],
+        "position_contract": position,
         "size_contract": {
             "schema": "fvp-native-import-size/1", "body": common["body"],
             "body_sha256": metadata["payload_sha256"],
@@ -544,7 +565,7 @@ def _discovered_native_default(event, archive, common, metadata, alpha, archive_
         },
         "notice": ("已从来源 HCB 分派器与 EXE 画幅读取器解析原生大小；"
                    "不按游戏名套参数，不对齐脸、不等高。"
-                   "坐标是可拖动的创作初值，不表示原作站位；特殊后缀覆盖、"
+                   + placement_notice + "特殊后缀覆盖、"
                    "既存角色缓存和剧情镜头不烘焙进导入大小。实机画面尚未验收。"),
     }
 

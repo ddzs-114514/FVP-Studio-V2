@@ -5,6 +5,7 @@ fifth-argument branch, and its native input-polling wait. Never substitute an
 arbitrary post-print callback for the click wait seen inside that wrapper.
 """
 from collections import Counter
+from dataclasses import replace
 
 from .native_call_flow import NativeFunctionFlow
 
@@ -134,3 +135,43 @@ def validate_internal_wait_source(runtime, analysis, selected):
                 pending.append(instruction.operands["value"])
     return dict(mode="exact_native_print_wait_dependency_bytes", function_count=len(seen),
                 print_includes_wait=True, runtime_verified=False)
+
+
+def choice_prompt_abi(context):
+    """Use only the proven text producer before the wrapper's click wait.
+
+    This is a choice-prompt ABI, not a replacement for normal dialogue. Native
+    text/name/backlog preparation remains intact; the native choice menu owns
+    the subsequent input wait. Unknown integrated printers remain blocked.
+    """
+    abi = context.abi
+    if getattr(abi, "print_includes_wait", None) is False:
+        return abi, dict(mode="native_print_with_separate_wait",
+                         ordinary_dialogue_unchanged=True, runtime_verified=False)
+    from .native_target_discovery import _function_regions
+    from .native_script_state import validate_native_script_pair
+
+    source, analysis = context.document, context.analysis_document
+    validate_native_script_pair(source, analysis, runtime_context=context)
+    selected = discover_internal_wait_printer(analysis, _function_regions(analysis))["selected"]
+    if not (selected and getattr(abi, "print_includes_wait", None) is True
+            and getattr(abi, "print_argument_count", None) == 5
+            and selected["print"]["start"] == getattr(abi, "print_target", None)
+            and selected["wait"]["start"] == getattr(abi, "wait_target", None)):
+        raise ValueError("此版本打印内的点击等待尚不能与选项提示分开。")
+    proof = validate_internal_wait_source(source, analysis, selected)
+    core = selected["core"]["start"]
+    # Recheck forwarding instead of accepting caller-supplied discovery data.
+    traced = NativeFunctionFlow(analysis).trace(abi.print_target, literal_arguments={4: None})
+    calls = traced.get("calls", [])
+    if (traced["status"] != "proven_static_argument_flow" or traced["global_writes"]
+            or len(calls) != 2 or [c.get("address") for c in calls] != [core, abi.wait_target]
+            or calls[0]["arguments"] != [{"kind": "argument", "index": i} for i in range(4)]
+            or calls[1]["arguments"]):
+        raise ValueError("选项提示没有完整的原生文字输出与点击等待分界。")
+    return replace(abi, print_target=core, print_argument_count=4, print_includes_wait=False), dict(
+        mode="native_internal_wait_text_producer", original_print_target=abi.print_target,
+        prompt_print_target=core, original_wait_target=abi.wait_target,
+        argument_forwarding=traced, runtime_binding=proof,
+        ordinary_dialogue_unchanged=True, original_script_functions_patched=False,
+        runtime_verified=False)

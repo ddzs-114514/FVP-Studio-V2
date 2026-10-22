@@ -27,6 +27,7 @@ from .performance_native_layout import resolve_native_layout
 from .performance_cg import make_adapter
 from .performance_framing import resolve_framing
 from .performance_geometry import shot_camera, SAFE_DEPTH
+from .camera_zoom_limits import zoom_range, check_camera_path
 from .performance_portrait_limits import checked_portrait_scale, check_native_portrait_scales
 from .performance_choices import CHOICE_KINDS, ChoiceEmitter, validate_choices
 from functools import lru_cache
@@ -511,28 +512,34 @@ class Emitter:
         rotation, alpha, sx, sy = 0, e['alpha'], scale, scale
         base_scale = scale
         if replacing and (keep or keep_position):
-            # Both policies retain the authored bottom-centre/depth/rotation.
-            # Only KEEP retains old size and anisotropy; SOURCE keeps the new
-            # uniform native size calculated above at the authored depth.
+            # Same-source KEEP retains the native coordinate origin as well
+            # as pixel scale. Cropped bitmaps have different bottom edges;
+            # replacing OP with each crop's bottom would shift the artwork.
+            # SOURCE / foreign archives retain the actual old bottom instead.
             if keep:
-                ratio = previous['body_meta']['height'] / b['height']
-                sx, sy = rounded(previous['sx']*ratio), rounded(previous['sy']*ratio)
-                base_scale = rounded(previous['base_scale']*ratio)
+                sx, sy = previous['sx'], previous['sy']
+                base_scale = previous['base_scale']
             if min(sx, sy, base_scale) <= 0:
                 raise ValueError('换角后比例退化')
-            old = previous['body_meta']
-            qx = old['offset_x'] + old['width']/2 - previous['pivot'][0]
-            qy = old['offset_y'] + old['height'] - previous['pivot'][1]
-            angle = previous['r']/3600*math.pi
-            x = rounded((previous['x']*2.4 + math.cos(angle)*qx-math.sin(angle)*qy)*previous['sx']/sx/2.4)
-            y = rounded((previous['y']*1.8 + math.sin(angle)*qx+math.cos(angle)*qy)*previous['sy']/sy/1.8)
-            pivot = (b['offset_x']+b['width']/2, b['offset_y']+b['height'])
-            pivot = tuple(rounded(v) for v in pivot)
+            same_origin = (keep and Path(previous['source_event']['archive']).resolve()
+                           == Path(e['archive']).resolve())
+            if same_origin:
+                x, y, pivot = previous['x'], previous['y'], tuple(previous['pivot'])
+            else:
+                old = previous['body_meta']
+                qx = old['offset_x'] + old['width']/2 - previous['pivot'][0]
+                qy = old['offset_y'] + old['height'] - previous['pivot'][1]
+                angle = previous['r']/3600*math.pi
+                x = rounded((previous['x']*2.4 + math.cos(angle)*qx-math.sin(angle)*qy)*previous['sx']/sx/2.4)
+                y = rounded((previous['y']*1.8 + math.sin(angle)*qx+math.cos(angle)*qy)*previous['sy']/sy/1.8)
+                pivot = (b['offset_x']+b['width']/2, b['offset_y']+b['height'])
+                pivot = tuple(rounded(v) for v in pivot)
             rotation, alpha = previous['r'], previous['alpha']
             e = {**e, 'depth': previous['z']}
-            layout = ({'label': '换角：保留画面位置 / 显示高度', 'geometry_mode': 'swap-keep/1'}
+            layout = ({'label': '换角：保留画面位置 / 缩放倍率', 'geometry_mode': 'swap-keep-scale/1'}
                 if keep else {'label': '换角：采用新来源大小，保留创作站位',
                               'geometry_mode': 'swap-source-size/1'})
+            layout['source_origin_preserved'] = same_origin
         check_native_portrait_scales(sx, sy, base_scale)
         self.clear_actor(actor)
         for syscall, v in (("GraphLoad", (part, "graph_bs/" + name)),
@@ -568,8 +575,19 @@ class Emitter:
         depths += [min(bounds) for bounds in self.depth_envelopes.values()]
         if not self.background_loaded and self.cg is None:
             raise ValueError("镜头运动前须有明确BG或CG基准")
-        if any(z-max(self.camera[2],target[2]) < SAFE_DEPTH for z in depths):
-            raise ValueError("镜头不能穿过图元深度或进入100以内的退化安全边界")
+        plane, base = self.camera_reference
+        bounds = zoom_range(plane, (0, 0, base), (1920, 1080),
+                            minimum_layer_distance=SAFE_DEPTH, depths=depths)
+        if "zoom" in e and e["zoom"] > bounds["max_percent"]:
+            raise ValueError(f"镜头取景会越过在场图层；此处最高可用 {bounds['max_percent']}%，请调整倍率或景深。")
+        # These coordinates are wrapper units. Test the float32/FloatToInt
+        # endpoints consumed by V3DMotion, not the smaller authored XY values.
+        def native_xyz(xyz):
+            f32 = lambda v: struct.unpack('<f', struct.pack('<f', v))[0]
+            return [int(f32(f32(xyz[0]) * f32(2.4))),
+                    int(f32(f32(xyz[1]) * f32(1.8))), xyz[2]]
+        check_camera_path(native_xyz(self.camera), native_xyz(target), [plane, *depths],
+                          minimum_layer_distance=SAFE_DEPTH)
         self.start_motion("camera", 0, self.native("camera", (*target, e["duration_ms"], e["curve"], True, 0, -1, 0, 0, None)))
         self.camera_envelope = [self.camera[2],target[2]]
         self.camera = target

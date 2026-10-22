@@ -152,6 +152,7 @@ class GuiRuntime:
     def health(self):
         return dict(ok=True, schema=SCHEMA, read_only=True, stage=[1280, 720],
                     capabilities=dict(background_blur_pair=True, portrait_catalog=True, native_size=True,
+                                      native_position=True,
                                       portrait_png=True, speaker_catalog=True, speaker_info=True,
                                       speaker_avatar_png=True, graphics_catalog=True,
                                       graphics_png=True, native_compile=False,
@@ -257,9 +258,12 @@ class GuiRuntime:
                   ("stage_x", "bottom_y", "height", "depth", "alpha")}
         return dict(ok=True, source=dict(id=source.id, name=source.name, archive=source.archive),
                     body=body, values=values, image=dict(width=b["width"], height=b["height"],
+                    offset_x=b["offset_x"], offset_y=b["offset_y"],
                     expression_count=f["frame_count"], url=self._url(source.id, body,
                         body_sha=b["payload_sha256"])),
-                    native_size=deepcopy(contract), notice=planned["notice"])
+                    native_size=deepcopy(contract),
+                    native_position=deepcopy(planned.get("position_contract")),
+                    notice=planned["notice"])
 
     def portrait_png(self, source_id, body, expression=0, body_sha256=None):
         source, b, f, stamp = self._pair(source_id, body)

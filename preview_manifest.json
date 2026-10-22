@@ -1,16 +1,27 @@
 {
   "schema": "fvp-gui-public-preview/1",
-  "date": "2026-10-05",
+  "date": "2026-10-22",
   "backend_included": true,
   "upload_ready": true,
   "package_scope": "gui_and_early_backend",
   "repository_visibility": "public",
   "license": "GPL-3.0-or-later",
   "backend_publication_audit_complete": true,
-  "backend_version": "0.2.1",
+  "backend_version": "0.2.2",
+  "release_input_sha256": "d63af0e8966b3197f34134f9076a01f4b122e4d40e492e0f6a79778c8aeb5c3a",
+  "release_input_digest_scope": "sorted relative-path to SHA256 map: selected source modules, formal GUI and public backend status",
+  "validation": {
+    "focused_tests_passed": 94,
+    "call_table_tests_passed": 8,
+    "portable_tests_passed": 26,
+    "portable_tests_skipped": 1,
+    "gui_model_checks": "passed",
+    "original_game_files_written": false,
+    "runtime_verified": false
+  },
   "requires_private_configuration": ["sources", "engine_recognition_signatures", "hoshi_connection_for_hoshi_export"],
-  "source_gui_sha256": "ebbd1bae6680e865b3fdf26b29532662bc852e7648d14b3c20ee064407c21763",
-  "preview_gui_sha256": "84b7da73fd98055ea559497b3c4b470b1c3956fe7965d0bd432c174b6c3915e0",
+  "source_gui_sha256": "1b1b3dccf3f2988f72ea54dd7d4ede7acce50f735f0bd1538bbbb4fbfa54c905",
+  "preview_gui_sha256": "91a5c09bf7ac0f64150f5ab89b4fe48b81f72692464536351b4a9e14c22c03e4",
   "css_unchanged": true,
   "changes": [
     "remove_embedded_real_asset_project",
@@ -23,7 +34,11 @@
     "replace_demo_dialogue",
     "replace_demo_choice_labels",
     "built_in_story_example_replaced_with_blank_project",
-    "add_GPL_3_or_later_license_notice"
+    "add_GPL_3_or_later_license_notice",
+    "sync_formal_GUI_and_completed_mainline_dependency_closure",
+    "extend_lazy_hash_gated_private_engine_bindings",
+    "preserve_portable_launcher_and_new_only_workspace_guards",
+    "include_read_only_original_call_table_tool_without_original_data"
   ],
   "test_games_included": false,
   "full_FVP_feature_coverage": false

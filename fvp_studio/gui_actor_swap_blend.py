@@ -55,6 +55,7 @@ class NativeActorSwapBlend:
                     whole_body_and_expression=True, native_import_size_unchanged=True,
                     keeps_authored_position=True, default_duration_ms=DEFAULT_DURATION_MS,
                     legacy_duration_ms=0, same_actor_alpha_overlap=False,
+                    same_actor_alpha_fused=True, alpha_duration_policy='max',
                     runtime_verified=False)
 
     def clear_shadow(self, actor):
@@ -138,14 +139,15 @@ class NativeActorSwapBlend:
         # The old source image has its original size; new geometry is exactly
         # the existing KEEP/SOURCE resolver's result.
         e.start_motion("alpha", main, e.native("alpha",
-            (main, 0, previous["alpha"], duration, 0, None, True, 0)))
+            (main, 0, portrait["alpha"], duration, 0, None, True, 0)))
         e.start_motion("alpha", ghost, e.native("alpha",
             (ghost, previous["alpha"], 0, duration, 0, None, True, 0)))
+        e.actors[actor]['alpha']=portrait['alpha']
 
     def mirror_motion(self, channel, ident):
         # Same-beat body geometry applies to both layers. Expression is new
-        # body's Parts only. Author alpha + crossfade needs two alpha channels
-        # per layer, so that combination is rejected by the GUI bridge.
+        # body's Parts only. A same-beat alpha target is already fused into
+        # the pair's endpoints; never mirror a second alpha onto either layer.
         if channel not in ("xy", "z", "r", "s2"):
             return
         actor = next((a for a in self.active if PRIMS[a] == ident), None)

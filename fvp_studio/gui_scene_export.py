@@ -34,6 +34,7 @@ from .performance_install import (
 from .performance_workflow import digest
 from .gui_cg_imports import GuiCgImports
 from .bin_archive import append_hzc_entries
+from .gui_target_selection import FILE_OPTIONS, validate_entry_name
 
 REQUEST_SCHEMA = "fvp-gui-scene-export-request/1"
 JOB_SCHEMA = "fvp-gui-scene-export-job/1"
@@ -63,7 +64,7 @@ def export_snapshot(request):
     try:
         object_only(request, "请求")
         required = {"schema", "request_id", "scene_id", "document"}
-        if not required.issubset(request) or set(request) - required - {"target_encoding"}:
+        if not required.issubset(request) or set(request) - required - {"target_encoding", *FILE_OPTIONS}:
             raise ValueError("生成请求缺少内容或包含未允许的选项")
         if request["schema"] != REQUEST_SCHEMA:
             raise ValueError("生成请求格式不支持")
@@ -79,6 +80,11 @@ def export_snapshot(request):
         if scene.get("id") != sid:
             raise ValueError("场景 ID 不一致")
         ident(project.get("source"), "目标游戏 ID")
+        for key in FILE_OPTIONS:
+            if key in request:
+                if project["source"] == "hoshi":
+                    raise ValueError("星空沿用现有独立测试入口，不能覆盖剧情文件或启动程序。")
+                validate_entry_name(request[key], key)
         if "target_encoding" in request and (project["source"] == "hoshi"
                 or type(request["target_encoding"]) is not str
                 or request["target_encoding"] not in TARGET_ENCODINGS):
@@ -131,7 +137,7 @@ def validate_bytes(source, clean, payload, emitter):
                                for ins in decoded.instructions):
         raise ExportError("invalid_candidate", "场景生成失败：生成的游戏脚本无法正确读取。")
     if bank is not None:
-        total = bank.total_before + len(bank.slots)
+        total = bank.total_before + bank.after - bank.before
         if any(ins.opcode in (0x0F, 0x11, 0x15, 0x17) and ins.operands["value"] >= total
                for ins in decoded.instructions):
             raise ExportError("invalid_candidate", "剧情指令引用了未分配的变量。")
@@ -315,6 +321,8 @@ class SceneExporter:
                           scene_jumps=emitter.jumps)
         if getattr(emitter, "story_bank", None) is not None:
             report["story_state"] = emitter.story_bank.report()
+        if getattr(emitter, 'legacy_audio_program', None) is not None:
+            report['audio_program'] = emitter.legacy_audio_program.report()
         folder = self.output_root / (self.family + "-" + digest(program)[:12] + "-" + secrets.token_hex(8))
         folder.mkdir(exist_ok=False)
         update("publishing", "正在保存生成文件…", output=dict(candidate_directory=str(folder)))
@@ -481,8 +489,9 @@ class ExportJobs:
         # current source. This is metadata only; browser paths remain forbidden.
         result = dict(scene_id=snapshot["scene_id"], scene_title=scene["title"],
                       target_source=snapshot["document"]["project"]["source"])
-        if "target_encoding" in snapshot:
-            result["target_encoding"] = snapshot["target_encoding"]
+        for key in ("target_encoding", *FILE_OPTIONS):
+            if key in snapshot:
+                result[key] = snapshot[key]
         return result
 
     def get(self, job_id=None):

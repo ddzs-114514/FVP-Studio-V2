@@ -24,6 +24,9 @@ class SoundRuntime(ChapterRuntime):
             upload_original_path_saved=False, native_export_source="hoshi")
         result["audio_contract"]["sources"].append(dict(source=SOURCE, name="本地声音",
                                                        kinds=sorted(KINDS), local=True))
+        from .gui_audio_program import playback_contract
+        result['audio_contract']['playback'] = playback_contract(['bgm', 'se', 'voice'])
+        result['audio_contract']['legacy_target_bound_playback'] = True
         result["voice_contract"] = dict(schema=CONTRACT, target="hoshi", sources="registered_or_uploaded",
             beat_field="voice", volume_default=100, exact_selected_asset=True,
             native_voice_channel=True, native_text_wait=True, native_mute_skip_guards=True,

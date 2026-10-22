@@ -19,14 +19,22 @@ def collect_patterns(source_dir):
     found = {}
     for module in sorted({key.split(":")[0] for key in APPROVED}):
         path = safe_local(root / (module + ".py"), file=True)
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, bytes):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
+            data = None
+            if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+                data = node.value
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and isinstance(node.func.value, ast.Name) and node.func.value.id == "bytes"
+                  and node.func.attr == "fromhex" and node.args
+                  and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                data = bytes.fromhex(node.args[0].value)
+            if data is None:
                 continue
             key = f"{module}:{node.lineno}:{node.col_offset}"
             if key in APPROVED:
-                if hashlib.sha256(node.value).hexdigest() != APPROVED[key]:
+                if hashlib.sha256(data).hexdigest() != APPROVED[key]:
                     raise ValueError("输入签名与既有审核算法不一致，拒绝导入")
-                found[key] = node.value.hex()
+                found[key] = data.hex()
     if set(found) != set(APPROVED):
         raise ValueError("本机输入缺少审核过的识别签名；不生成不完整替代规则")
     result = {"schema": SCHEMA, "patterns": found}

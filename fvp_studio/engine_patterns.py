@@ -9,6 +9,7 @@ from .engine_pattern_manifest import APPROVED
 from .local_binding import safe_local, unique_object, stat_identity
 
 SCHEMA = "fvp-engine-patterns/1"
+MAX_CONFIG_BYTES = 512 * 1024
 
 def validate_patterns(config):
     if not isinstance(config, dict) or set(config) != {"schema", "patterns"} or config["schema"] != SCHEMA:
@@ -28,8 +29,10 @@ def validate_patterns(config):
 
 @lru_cache(maxsize=2)
 def _read(path, identity):
+    if Path(path).stat().st_size > MAX_CONFIG_BYTES:
+        raise ValueError("本机引擎签名配置过大")
     raw = Path(path).read_bytes()
-    if len(raw) > 128 * 1024:
+    if len(raw) > MAX_CONFIG_BYTES:
         raise ValueError("本机引擎签名配置过大")
     if stat_identity(Path(path).stat()) != identity:
         raise ValueError("读取时本机引擎签名发生变化")

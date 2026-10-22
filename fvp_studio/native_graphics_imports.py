@@ -8,6 +8,7 @@ This packer does not infer native call signatures or enable unsupported effects.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 from .bin_archive import append_entries_file, archive_entry_table_file, hzc_metadata
 from .gui_runtime import fingerprint
@@ -65,14 +66,14 @@ class NativeGraphicsImports:
         if archive not in self.names:
             self.names[archive] = {row[2] for row in archive_entry_table_file(destination)}
             self.check_unchanged()
-        additions = self.payloads.setdefault(archive, {})
-        # Check the entire body/face pair before adding either entry.
+        additions = self.payloads.get(archive, {})
+        # Check the entire family before adding any entry or empty pack.
         for name, payload in payloads.items():
             if name in self.names[archive]:
                 raise ValueError("导入素材名与目标已有资源冲突，不覆盖原资源。")
             if name in additions and additions[name] != payload:
                 raise ValueError("导入素材内容标识冲突。")
-        additions.update(payloads)
+        self.payloads.setdefault(archive, {}).update(payloads)
 
     def bind(self, role, archive_path, resource_name, *, target_archive=None):
         if self.published:
@@ -107,6 +108,101 @@ class NativeGraphicsImports:
         result = dict(reference, target_archive=archive, target_resource_name=name,
                       imported=True, source_payload_preserved_exactly=True,
                       image_resampled=False, native_geometry_defaults_preserved=True)
+        self.references.append(result)
+        return result
+
+    def bind_cg(self, backend, archive_path, resource_name, *, source_backend=None,
+                target_archive=None, suffix_mapping=None):
+        """Bind a complete, source-proven CG family to this target's own route.
+
+        Normal/large images are separate original payloads, never a generated
+        enlargement or a guessed buffer. A foreign family needs its OWN HCB
+        binding; matching filenames alone do not prove what a suffix means.
+        This prepares an additive pack only, not a scene/display capability.
+        """
+        from .native_cg_backend import NativeCGBackend
+        from .native_cg_presentation import NativeCGVisibility
+        from .native_script_state import validate_native_script_pair
+
+        if self.published:
+            raise ValueError("素材包已生成，不能再追加资源。")
+        if (not isinstance(backend, NativeCGBackend)
+                or self.routes.get("event_visual") != backend.archive_selectors):
+            raise ValueError("CG 打包缺少当前目标完整的原生资源路由。")
+        validate_native_script_pair(backend.source, backend.analysis, runtime_context=backend.context)
+        path = self._freeze(archive_path)
+        if source_backend is None:
+            if path.parent != self.root:
+                raise ValueError("跨游戏 CG 需要来源游戏自己的原生资源配对。")
+            source_backend = backend
+        if not isinstance(source_backend, NativeCGBackend):
+            raise ValueError("CG 来源没有绑定原生加载调用链。")
+        validate_native_script_pair(source_backend.source, source_backend.analysis,
+                                    runtime_context=source_backend.context)
+        source_plan = source_backend.resource_plan(path.name, resource_name)
+        source_suffixes = {r["suffix"] for r in source_plan["resources"]}
+        routes = self.routes["event_visual"]
+        if target_archive is not None:
+            archive = str(target_archive).casefold()
+        elif path.parent == self.root and path.name.casefold() in routes:
+            archive = path.name.casefold()
+        else:
+            archive = default_archive(routes)
+        if archive not in routes:
+            raise ValueError("CG 导入目的资源包不在当前目标的原生路由中。")
+        target_plan = backend.resource_plan(archive, resource_name)
+        target_suffixes = {r["suffix"] for r in target_plan["resources"]}
+        if suffix_mapping is None:
+            if len(target_suffixes) == 1 and len(source_suffixes) > 1:
+                policy = NativeCGVisibility(source_backend.context, source_backend).policy(path.name)
+                prefix = source_backend.routes[source_plan["archive"]][0]["prefix"]
+                visible = {r["suffix"] for r in source_backend.resource_graphs
+                    if r["prefix"] == prefix and r["graph"] == policy["visible_primitive"]}
+                if len(visible) != 1:
+                    raise ValueError("来源 CG 的普通图／大图没有唯一的显示资源。")
+                mapping = {next(iter(target_suffixes)):next(iter(visible))}
+            else:
+                mapping = {suffix:suffix for suffix in target_suffixes}
+        else:
+            if not isinstance(suffix_mapping, dict):
+                raise ValueError("CG 普通图／大图配对无效。")
+            mapping = dict(suffix_mapping)
+        if (set(mapping) != target_suffixes or any(type(v) is not str or v not in source_suffixes
+                for v in mapping.values()) or len(set(mapping.values())) != len(mapping)):
+            raise ValueError("CG 需要完整且各自独立的原生普通图／大图，不会补图或放大原图。")
+        # Read and validate the ENTIRE proven source family before queuing any
+        # member, including variants not used by a single-plane destination.
+        originals, refs = {}, {}
+        for row in source_plan["resources"]:
+            payload, reference = resource_reference(path, row["resource"])
+            meta = hzc_metadata(payload).to_dict()
+            if meta["kind"] != 0 or meta["frame_count"] != 1:
+                raise ValueError("CG 普通图／大图都须是完整的单帧原图。")
+            originals[row["suffix"]], refs[row["suffix"]] = payload, reference
+        self.check_unchanged()
+        preserve = (path.parent == self.root and path.name.casefold() == archive
+            and source_backend.source.source_sha256 == backend.source.source_sha256
+            and mapping == {s:s for s in target_suffixes} and source_suffixes == target_suffixes)
+        if preserve:
+            name, imported = resource_name, False
+        else:
+            # Include each suffix AND payload hash, with unambiguous framing.
+            # A changed large image alone must never alias an older pair.
+            identity = json.dumps([(s, sha(originals[mapping[s]])) for s in sorted(mapping)],
+                ensure_ascii=True, separators=(",", ":")).encode("ascii")
+            name, imported = "FVP_GUI_CG_" + sha(identity).upper(), True
+            self._queue(archive, {name+s:originals[source] for s, source in mapping.items()})
+        result = dict(target_archive=archive, target_resource_name=name, imported=imported,
+            suffix_mapping=mapping, source_native_resources=refs,
+            resources_by_suffix={s:dict(refs[source], target_resource_name=name+s)
+                                 for s, source in mapping.items()},
+            metadata_by_suffix={s:hzc_metadata(originals[source]).to_dict() for s, source in mapping.items()},
+            source_hcb_sha256=source_backend.source.source_sha256,
+            target_hcb_sha256=backend.source.source_sha256,
+            source_payload_preserved_exactly=True, image_resampled=False,
+            complete_source_family_checked=True, complete_target_family_queued=imported,
+            fabricated_large_image=False, game_name_switch_used=False,
+            scene_export_connected=False, runtime_verified=False)
         self.references.append(result)
         return result
 

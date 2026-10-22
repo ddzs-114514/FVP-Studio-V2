@@ -32,7 +32,7 @@ class _Value:
             return {"kind": self.kind, "type": self.data[0], "value": self.data[1]}
         if self.kind == "argument":
             return {"kind": self.kind, "index": self.data[0]}
-        if self.kind == "global_read":
+        if self.kind in {"global_read", "global_unknown"}:
             return {"kind": self.kind, "slot": self.data[0], "offset": self.data[1]}
         if self.kind == "uninitialized_local":
             return {"kind": self.kind, "slot": self.data[0]}
@@ -103,6 +103,10 @@ def _constant_operator(name: str, operands: tuple[_Value, ...], non_nil_argument
         return _literal(equal if name == "set_e" else not equal)
     if name in {"and", "or"} and all(type(x) is bool for x in values):
         return _literal(left and right if name == "and" else left or right)
+    if (name in {"set_g", "set_ge", "set_l", "set_le"}
+            and all(type(x) is int and -(2 ** 31) <= x < 2 ** 31 for x in values)):
+        return _literal({"set_g": left > right, "set_ge": left >= right,
+                         "set_l": left < right, "set_le": left <= right}[name])
     return symbolic
 
 
@@ -111,9 +115,10 @@ class _State:
     stack: tuple[_Value, ...] = ()
     slots: dict[int, _Value] = field(default_factory=dict)
     returned: _Value = field(default_factory=lambda: _Value("unknown_return"))
+    globals: dict[int, _Value] = field(default_factory=dict)
 
     def clone(self) -> _State:
-        return _State(self.stack, dict(self.slots), self.returned)
+        return _State(self.stack, dict(self.slots), self.returned, dict(self.globals))
 
 
 class NativeFunctionFlow:
@@ -127,11 +132,54 @@ class NativeFunctionFlow:
                                                else len(document.instructions))
             for n, i in enumerate(starts)
         }
+        self._global_write_cache: dict[int, tuple[frozenset[int], tuple[int, ...]]] = {}
+
+    def _source_global_writes(self, address: int) -> frozenset[int]:
+        """Conservative raw-script inventory, including all callee branches.
+
+        This kills incoming facts; it never executes a callee or assumes a
+        value it may assign. Native syscall effects are not modelled here.
+        """
+        if address in self._global_write_cache:
+            writes, functions = self._global_write_cache[address]
+            for a in functions:
+                first, end = self.entries[a]
+                if any(i.dirty or i.warning or not i.known for i in self.document.instructions[first:end]):
+                    raise NativeCallFlowError("global_effect_unknown_or_modified_instruction")
+            return writes
+        pending, seen, writes, instructions = [address], set(), set(), 0
+        total = self.document.header.non_volatile_globals + self.document.header.volatile_globals
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            if current not in self.entries:
+                raise NativeCallFlowError("global_effect_callee_not_exact_entry")
+            seen.add(current)
+            first, end = self.entries[current]
+            instructions += end-first
+            if len(seen) > 1024 or instructions > 262144:
+                raise NativeCallFlowError("global_effect_inventory_limit")
+            for item in self.document.instructions[first:end]:
+                if item.dirty or item.warning or not item.known:
+                    raise NativeCallFlowError("global_effect_unknown_or_modified_instruction")
+                if item.mnemonic in {"pop_global", "pop_global_table"}:
+                    slot = item.operands["value"]
+                    if type(slot) is not int or not 0 <= slot < total:
+                        raise NativeCallFlowError("global_effect_slot_outside_header")
+                    writes.add(slot)
+                elif item.mnemonic == "call":
+                    pending.append(item.operands["target"])
+        result = frozenset(writes)
+        self._global_write_cache[address] = (result, tuple(sorted(seen)))
+        return result
 
     def trace(self, address: int, *, max_instructions: int = 2048,
               literal_arguments: Mapping[int, Any] | None = None,
               max_joined_values: int = 16,
-              non_nil_arguments: Iterable[int] | None = None) -> dict[str, Any]:
+              non_nil_arguments: Iterable[int] | None = None,
+              track_global_literals: bool = False,
+              literal_globals: Mapping[int, Any] | None = None) -> dict[str, Any]:
         base = {
             "schema": FLOW_SCHEMA, "source_sha256": self.document.source_sha256,
             "function_address": address, "writes_performed": False,
@@ -141,6 +189,18 @@ class NativeFunctionFlow:
         try:
             if type(max_joined_values) is not int or not 1 <= max_joined_values <= 128:
                 raise NativeCallFlowError("invalid_joined_value_limit")
+            if type(track_global_literals) is not bool:
+                raise NativeCallFlowError("invalid_global_tracking_option")
+            if literal_globals is not None and (not track_global_literals or not isinstance(literal_globals, Mapping)):
+                raise NativeCallFlowError("invalid_literal_global_specialization")
+            globals_ = dict(literal_globals or {})
+            total = self.document.header.non_volatile_globals + self.document.header.volatile_globals
+            if any(type(k) is not int or not 0 <= k < total or
+                   not (v is None or type(v) in {int, bool, str}) for k, v in globals_.items()):
+                raise NativeCallFlowError("invalid_literal_global_specialization")
+            if track_global_literals:
+                base.update(scope="forward_cfg_with_source_global_write_kills",
+                            literal_globals=globals_, native_syscall_global_effects_reviewed=False)
             if type(address) is not int or address not in self.entries:
                 raise NativeCallFlowError("address_is_not_an_exact_function_entry")
             first, end = self.entries[address]
@@ -168,7 +228,8 @@ class NativeFunctionFlow:
                 base["non_nil_arguments"] = sorted(facts)
             base.update(argument_count=count, local_count=local_count)
             base["max_joined_values"] = max_joined_values
-            result = self._trace_body(body, count, local_count, literals, max_joined_values, frozenset(facts))
+            result = self._trace_body(body, count, local_count, literals, max_joined_values,
+                                      frozenset(facts), track_global_literals, globals_)
             return {**base, "status": "proven_static_argument_flow", "blockers": [], **result}
         except (NativeCallFlowError, KeyError, IndexError) as exc:
             return {**base, "status": "blocked", "calls": [], "global_writes": [],
@@ -176,12 +237,14 @@ class NativeFunctionFlow:
 
     def _trace_body(self, body, count: int, local_count: int,
                     literal_arguments: Mapping[int, Any] | None = None,
-                    max_joined_values: int = 16, non_nil_arguments=frozenset()) -> dict[str, Any]:
+                    max_joined_values: int = 16, non_nil_arguments=frozenset(),
+                    track_global_literals=False, literal_globals=None) -> dict[str, Any]:
         by_offset = {x.offset: i for i, x in enumerate(body)}
-        states: dict[int, _State] = {1: _State()}
+        states: dict[int, _State] = {1: _State(globals={k: _literal(v) for k, v in (literal_globals or {}).items()})}
         queue = [1]
         calls: list[dict[str, Any]] = []
         global_writes: list[dict[str, Any]] = []
+        global_reads: list[dict[str, Any]] = []
         branches: list[dict[str, Any]] = []
         returns: list[dict[str, Any]] = []
         visited = 0
@@ -211,6 +274,12 @@ class NativeFunctionFlow:
                 keys = prior.slots.keys() | incoming.slots.keys()
                 prior.slots = {k: _choice(prior.slots.get(k, original(k)),
                                         incoming.slots.get(k, original(k)), limit=max_joined_values) for k in keys}
+                if track_global_literals:
+                    keys = prior.globals.keys() | incoming.globals.keys()
+                    prior.globals = {k: _choice(
+                        prior.globals.get(k, _Value("global_unknown", (k, body[index].offset))),
+                        incoming.globals.get(k, _Value("global_unknown", (k, body[index].offset))),
+                        limit=max_joined_values) for k in keys}
 
         def consume(stack: list[_Value], argc: int) -> tuple[_Value, ...]:
             if len(stack) < argc:
@@ -243,19 +312,30 @@ class NativeFunctionFlow:
                 original(slot)  # Reserved and out-of-frame slots are not values.
                 state.slots[slot] = consume(stack, 1)[0]
             elif name == "push_global":
-                # Even after a prior assignment, a native callee may have changed
-                # the global. Do not invent interprocedural state invariants.
-                stack.append(_Value("global_read", (int(item.operands["value"]), item.offset)))
+                slot = int(item.operands["value"])
+                if track_global_literals and not 0 <= slot < (self.document.header.non_volatile_globals + self.document.header.volatile_globals):
+                    raise NativeCallFlowError("global_slot_outside_header")
+                unknown = _Value("global_read", (slot, item.offset))
+                value = state.globals.get(slot, unknown) if track_global_literals else unknown
+                stack.append(value)
+                if track_global_literals:
+                    global_reads.append(dict(offset=item.offset, slot=slot, value=value.public()))
             elif name == "pop_global":
                 value = consume(stack, 1)[0]
                 global_writes.append({"offset": item.offset, "slot": item.operands["value"],
                                       "value": value.public()})
+                if track_global_literals:
+                    slot = item.operands["value"]
+                    total = self.document.header.non_volatile_globals + self.document.header.volatile_globals
+                    if type(slot) is not int or not 0 <= slot < total:
+                        raise NativeCallFlowError("global_slot_outside_header")
+                    state.globals[slot] = value
             elif name == "push_return":
                 stack.append(state.returned)
             elif name == "neg":
                 operands = consume(stack, 1)
                 stack.append(_constant_operator("neg", operands, non_nil_arguments)
-                             if literal_arguments or non_nil_arguments else _Value("neg", operands))
+                             if literal_arguments or non_nil_arguments or track_global_literals else _Value("neg", operands))
             # Binary stack effects agree with RFVP's script/context.rs.
             # Keep operators symbolic; do not invent their concrete result or
             # simplify branch-dependent Nil/default values into a single value.
@@ -263,7 +343,7 @@ class NativeFunctionFlow:
                           "set_g", "set_ge", "set_l", "set_le"}:
                 operands = consume(stack, 2)
                 stack.append(_constant_operator(name, operands, non_nil_arguments)
-                             if literal_arguments or non_nil_arguments else _Value(name, operands))
+                             if literal_arguments or non_nil_arguments or track_global_literals else _Value(name, operands))
             elif name in {"call", "syscall"}:
                 if name == "syscall":
                     syscall_id = int(item.operands["id"])
@@ -282,10 +362,19 @@ class NativeFunctionFlow:
                     argc = int(entry.operands["args"])
                     identity = {"address": target}
                 arguments = consume(stack, argc)
-                calls.append({"offset": item.offset, "kind": name, **identity,
+                record = {"offset": item.offset, "kind": name, **identity,
                               "argument_count": argc, "arguments": [x.public() for x in arguments],
                               "parameter_dependencies": sorted(set().union(*(x.dependencies() for x in arguments))),
-                              "callee_semantics_reviewed": False})
+                              "callee_semantics_reviewed": False}
+                if track_global_literals:
+                    record["literal_globals_before_call"] = {k: v.data[1] for k, v in state.globals.items()
+                                                              if v.kind == "literal"}
+                    if name == "call":
+                        killed = self._source_global_writes(target)
+                        record["source_written_globals_invalidated"] = sorted(killed)
+                        for slot in killed:
+                            state.globals[slot] = _Value("global_unknown", (slot, item.offset))
+                calls.append(record)
                 state.returned = _Value("call_return", (name, target, item.offset, arguments))
             elif name in {"jmp", "jz"}:
                 target = int(item.operands["target"])
@@ -318,5 +407,7 @@ class NativeFunctionFlow:
         if not returns:
             raise NativeCallFlowError("no_reachable_return")
         return {"calls": calls, "global_writes": global_writes, "branches": branches,
+                **({"global_reads": global_reads} if track_global_literals else {}),
                 "returns": returns, "reachable_instruction_count": visited,
-                "callee_effects": "not_expanded_or_reviewed"}
+                "callee_effects": ("source_script_writes_kill_facts_native_effects_not_reviewed"
+                                   if track_global_literals else "not_expanded_or_reviewed")}

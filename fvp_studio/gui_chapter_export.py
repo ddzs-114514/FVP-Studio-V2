@@ -27,7 +27,16 @@ class ChapterExporter(SceneExporter):
         return validate_chapter_program(program)
 
     def make_emitter(self, source, clean, program):
-        return GuiChapterEmitter(source, clean)
+        masks = None
+        wanted = {e["transition"]["mask"] for e in program["events"]
+                  if e.get("kind") == "GuiChapterExit" and e.get("transition", {}).get("type") == "mask"
+                  and e.get("mode") != "end"}
+        if wanted:
+            binding = self.runtime.chapter_transitions().binding("hoshi")
+            masks = binding["masks"]
+            if masks is None or not wanted <= set(masks.items) or masks.screen.source.original_bytes != source:
+                raise ExportError("chapter_mask_not_connected", "章节选择的遮罩与当前原作资源、运行脚本不匹配。")
+        return GuiChapterEmitter(source, clean, transition_masks=masks)
 
 
 class ChapterExportJobs(ExportJobs):

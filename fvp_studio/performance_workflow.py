@@ -11,6 +11,7 @@ import hashlib
 import json
 
 from .performance_portrait_limits import HEIGHT_MIN, HEIGHT_MAX
+from .camera_zoom_limits import ZOOM_MIN, ZOOM_SCHEMA_MAX
 
 SCHEMA = "fvp-studio.performance.v1"
 PREFIX = "FVPV2_Performance"
@@ -90,14 +91,14 @@ DEFINITIONS = {
         field("duration_ms", "动作时长（毫秒；表情0=直接切换）", 2400, 0, 6000),
         field("curve", "运动节奏（2慢起步／3慢收尾）", 3, 2, 3)]),
     "Camera": ("镜头移动 / 推拉（共享 V3D）", [field("x", "原作镜头 X", 0, -120, 120),
-        field("y", "原作镜头 Y", 0, -80, 80), field("zoom", "相对本场BG/CG基准取景（%）", 100, 80, 150),
+        field("y", "原作镜头 Y", 0, -80, 80), field("zoom", "相对本场BG/CG基准取景（%）", 100, ZOOM_MIN, ZOOM_SCHEMA_MAX),
         field("duration_ms", "运动时长（毫秒）", 2800, 200, 6000), field("curve", "原生曲线", 3, 2, 3)]),
     "CameraNative": ("镜头 · 原作XYZ组合复现", [field("x", "原作镜头 X", 0, -240, 240),
         field("y", "原作镜头 Y", 0, -120, 120), field("z", "原作镜头 Z（非百分比）", 0, -800, 850),
         field("duration_ms", "运动时长（毫秒）", 2800, 200, 6000), field("curve", "原生曲线", 3, 2, 3)]),
     "CameraShot": ("镜头 · 可视取景（共享V3D）", [field("center_x", "取景中心 X（基准舞台，可拖框）", 640, 0, 1280),
         field("center_y", "取景中心 Y（基准舞台，可拖框）", 360, 0, 720),
-        field("zoom", "BG/CG参考平面倍率（%）", 100, 80, 150),
+        field("zoom", "BG/CG参考平面倍率（%）", 100, ZOOM_MIN, ZOOM_SCHEMA_MAX),
         field("duration_ms", "名义时长（毫秒）", 1200, 200, 6000), field("curve", "曲线：2慢到快／3快到慢", 3, 2, 3)]),
     "Dialogue": ("台词 / 观察点（与动作同时）", [field("case_id", "测试编号", "A01"),
         field("text", "游戏内台词 / 观察说明", ""), field("expected", "验收要点（不写入游戏）", "")]),

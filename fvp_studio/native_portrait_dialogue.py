@@ -13,6 +13,7 @@ import hashlib
 import struct
 
 from .hcb import parse_bytes
+from .hoshimemo_scene_hook import _call, _push_global, _pop_global
 from .native_portrait_acceptance import NativePortraitAcceptanceError, _function_spans
 from .native_script_state import NativeScriptStateClosure, validate_native_script_pair
 
@@ -53,18 +54,32 @@ def _translated_literal_stub(source, analysis, item, actual):
 
 
 class NativePortraitDialogue:
-    def __init__(self, context, lifecycle, output):
+    def __init__(self, context, lifecycle, output, *, roots=None,
+                 suppress_scope="owned_scene_dialogue_only", cg_guard=None):
         source, analysis = context.document, context.analysis_document
         pair_binding = validate_native_script_pair(source, analysis, runtime_context=context)
+        guard_prefix = "cg"
+        if cg_guard is not None:
+            from .native_cg_dialogue_guard import NativeCGDialogueGuard
+            from .native_scene_dialogue_guard import NativeSceneDialogueGuard
+            # Retain the existing keyword and clone/entry-wrapper contract.
+            if not isinstance(cg_guard, (NativeCGDialogueGuard, NativeSceneDialogueGuard)) or cg_guard.context is not context:
+                raise NativePortraitAcceptanceError("CG 交接保护不属于当前场景脚本。")
+            if isinstance(cg_guard, NativeSceneDialogueGuard):
+                guard_prefix = "scene"
         spans = {s.start: s for s in _function_spans(analysis)}
-        roots = {context.abi.print_target, context.abi.wait_target}
+        roots = ({context.abi.print_target, context.abi.wait_target}
+                 if roots is None else set(roots))
+        if not roots or suppress_scope not in {
+                "owned_scene_dialogue_only", "owned_scene_menu_only"}:
+            raise NativePortraitAcceptanceError("场景交接缺少限定的原生调用入口。")
         # Speaker/name/backlog-avatar selection remains the target's existing
         # independently validated call. Do not clone every unused speaker or
         # turn this portrait fix into a target-wide speaker ABI relaxation.
         records = [lifecycle.get("clear"), lifecycle.get("apply")]
         records.extend(lifecycle.get("delegates", {}).values())
         suppressed = {int(s["start"]) for s in records if s}
-        if not suppressed or any(s not in spans for s in suppressed | roots):
+        if (not suppressed and cg_guard is None) or any(s not in spans for s in suppressed | roots):
             raise NativePortraitAcceptanceError("台词舞台交接缺少原生函数身份。")
         # Include explicitly marked native ThreadStart function pointers. They
         # are not inferred from arbitrary integer operands or a game name.
@@ -112,21 +127,49 @@ class NativePortraitDialogue:
         closure = NativeScriptStateClosure(analysis, analysis, sorted(reachable),
             max_functions=512, max_instructions=524288)
         selected = suppressed & reachable
-        changed = set(selected)
+        cg_reachable = set()
+        if cg_guard is not None:
+            pending = list(roots)
+            while pending:
+                address = pending.pop()
+                if address in cg_reachable:
+                    continue
+                cg_reachable.add(address)
+                if address not in selected:
+                    pending.extend(edges[address]-cg_reachable)
+        guarded_sites, guarded_records = (cg_guard.sites(spans, cg_reachable, selected & cg_reachable, roots=roots)
+            if cg_guard is not None else ({}, []))
+        changed = set(selected) | {r["function"] for r in guarded_records}
+        protected_globals = cg_guard.camera_cache_slots if cg_guard is not None else ()
+        if protected_globals:
+            changed.update(roots)
         while True:
             parents = {a for a, children in edges.items() if children & changed}
             if parents <= changed:
                 break
             changed.update(parents)
         self.source, self.analysis = source, analysis
+        self.cg_guard = cg_guard
         self.mapping, section = {}, bytearray()
-        cloned_stubs = {}
+        self.entry_mapping = {}
+        cloned_stubs, guard_entries, instruction_maps = {}, {}, {}
         if changed:
             address = len(source.original_bytes) + len(output) + 5
+            if guarded_sites:
+                guard_code, guard_entries = cg_guard.compile_wrappers(set(guarded_sites.values()), address)
+                section.extend(guard_code)
+                address += len(guard_code)
             for original in sorted(changed):
                 span = spans[original]
                 self.mapping[original] = address
-                address += 4 if original in selected else span.end - span.start
+                if original in selected:
+                    address += 4
+                    continue
+                offsets = {}
+                for item in span.instructions:
+                    offsets[item.offset] = address
+                    address += 5 if item.offset in guarded_sites else item.size
+                instruction_maps[original] = offsets
             for offset, stub in sorted(translated_stubs.items()):
                 if stub["function"] in changed:
                     cloned_stubs[offset] = address
@@ -140,40 +183,77 @@ class NativePortraitDialogue:
                     # on return; dropping a call opcode would leak its arguments.
                     section.extend(bytes((1, span.args, 0, 4)))
                     continue
-                raw = bytearray(source.original_bytes[span.start:span.end])
+                offsets = instruction_maps[original]
                 for item in span.instructions:
                     if item.offset in cloned_stubs:
-                        relative = item.offset - span.start
-                        raw[relative:relative + item.size] = (
+                        section.extend(
                             b"\x06" + struct.pack("<I", cloned_stubs[item.offset]) + bytes(item.size - 5))
                         continue
+                    if item.offset in guarded_sites:
+                        section.extend(b"\x02"+struct.pack("<I", guard_entries[guarded_sites[item.offset]]))
+                        continue
+                    raw = bytearray(source.original_bytes[item.offset:item.offset+item.size])
                     target = None
                     if item.mnemonic in {"jmp", "jz"}:
                         original_target = item.operands["target"]
-                        if not span.start <= original_target < span.end:
+                        if original_target not in offsets:
                             raise NativePortraitAcceptanceError("台词分支越过被复制的原生函数。")
-                        target = self.mapping[original] + original_target - span.start
+                        target = offsets[original_target]
                     elif item.mnemonic == "call":
                         target = self.mapping.get(item.operands["target"])
                     elif item.address_role == "thread_start_function_pointer":
                         target = self.mapping.get(item.operands["value"])
                     if target is not None:
-                        struct.pack_into("<I", raw, item.offset - span.start + 1, target)
-                section.extend(raw)
+                        struct.pack_into("<I", raw, 1, target)
+                    section.extend(raw)
             # Rehome each verified text-only trampoline too. Keeping its old
             # return pointer would escape into the ORIGINAL portrait refresh.
             for offset in sorted(cloned_stubs):
                 stub = translated_stubs[offset]
                 original = stub["function"]
-                return_at = self.mapping[original] + stub["return_offset"] - spans[original].start
+                return_at = instruction_maps[original][stub["return_offset"]]
                 section.extend(stub["literal"] + b"\x06" + struct.pack("<I", return_at))
+            self.entry_mapping.update(self.mapping)
+            if protected_globals:
+                # Cache restoration surrounds only authored print/menu entry
+                # calls. Internal calls keep the native clone graph. Values
+                # live on this call's stack, not shared scratch globals, so
+                # nested entries do not overwrite each other's snapshots.
+                for original in sorted(roots):
+                    argc = spans[original].args
+                    if not 0 <= argc <= 127:
+                        raise NativePortraitAcceptanceError("镜头缓存保护入口的参数超过原生栈范围。")
+                    self.entry_mapping[original] = address
+                    wrapper = bytearray(bytes((1, argc, 1)))
+                    for g in protected_globals:
+                        wrapper.extend(_push_global(g))
+                    for index in range(argc):
+                        wrapper.extend(b"\x10"+struct.pack("<b", index-argc-1))
+                    wrapper.extend(_call(self.mapping[original])+b"\x14\x16\0")
+                    for g in reversed(protected_globals):
+                        wrapper.extend(_pop_global(g))
+                    wrapper.extend(b"\x10\0\x05")  # Preserve the original root's result.
+                    section.extend(wrapper)
+                    address += len(wrapper)
+                if address >= 2**31:
+                    raise NativePortraitAcceptanceError("镜头缓存保护入口超出目标有符号地址范围。")
             output.extend(b"\x06" + struct.pack("<I", address) + section)
         self._report = dict(schema="fvp-native-portrait-dialogue/1",
             original_source_functions_patched=False, native_click_wait_preserved=True,
             original_speaker_calls_preserved=True,
-            motion_join_inserted_before_text=False, suppress_scope="owned_scene_dialogue_only",
+            motion_join_inserted_before_text=False, suppress_scope=suppress_scope,
+            native_entry_roots=sorted(roots),
             native_portrait_targets=sorted(selected),
-            function_map={str(k): v for k, v in self.mapping.items()},
+            **{f"{guard_prefix}_handle_guard": cg_guard.report() if cg_guard is not None else None,
+               f"{guard_prefix}_guarded_syscall_sites": guarded_records,
+               f"{guard_prefix}_guard_entries": deepcopy(guard_entries),
+               f"{guard_prefix}_effective_reachable_functions": sorted(cg_reachable)},
+            variable_width_instruction_relocation=bool(guarded_sites),
+            function_map={str(k): v for k, v in self.entry_mapping.items()},
+            internal_clone_map={str(k): v for k, v in self.mapping.items()},
+            camera_cache_entry_global_ids=list(protected_globals),
+            camera_cache_entry_snapshot_restored=bool(protected_globals),
+            camera_cache_snapshot_scope="each_authored_entry_stack_frame" if protected_globals else None,
             clone_count=len(changed), clone_sha256=hashlib.sha256(section).hexdigest(),
             runtime_binding=pair_binding, runtime_text_literals_preserved=literal_changes,
             runtime_text_trampolines=[dict(offset=offset, function=stub["function"],
@@ -189,10 +269,12 @@ class NativePortraitDialogue:
         doc = parse_bytes(struct.pack("<I", 4 + len(payload)) + payload + table, self.source.encoding)
         if doc.warnings:
             raise NativePortraitAcceptanceError("台词程序有未解析指令，不能交接舞台。")
+        if self.cg_guard is not None:
+            self.cg_guard.check_entry_results(doc, self.mapping)
         output = bytearray(payload)
         for item in doc.instructions:
             if item.mnemonic == "call" and item.operands["target"] in self.mapping:
-                struct.pack_into("<I", output, item.offset - 4 + 1, self.mapping[item.operands["target"]])
+                struct.pack_into("<I", output, item.offset - 4 + 1, self.entry_mapping[item.operands["target"]])
         return bytes(output)
 
     def report(self):

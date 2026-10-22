@@ -23,15 +23,21 @@ from .portrait_emitter import _encode_push
 from .gui_story_logic import (KINDS as LOGIC_KINDS, effects, predicate, route_targets,
                               event_values as logic_values, variables)
 from .gui_story_program import StoryVariableBank
+from .gui_chapter_transition import transition_values
 
 NORMAL_KINDS = {"Background", "Portrait", "PortraitNative", "PortraitFraming", "PortraitSwap",
                 "Action", "Camera", "CameraShot", "CameraNative", "Dialogue", "Text", "Speech",
                 "Wait", "Hide", "Transition", "Choice", "ChoiceCase", "ChoiceEnd"}
 
 
-def exit_values(event, definitions=None):
+def exit_values(event, definitions=None, *, encoding="gbk"):
     definitions = definitions or {}
     common = {"kind", "scene_id", "mode", "target", "prompt", "options"}
+    if "transition" in event:
+        if event["transition"] is None:
+            raise ValueError("衔接设置不能为 null。")
+        transition_values(event["transition"])
+        common.add("transition")
     if set(event) != common | ({"test", "then", "else"} if event.get("mode") == "condition" else set()):
         raise ValueError("场景出口字段不完整。")
     mode = event["mode"]
@@ -62,7 +68,7 @@ def exit_values(event, definitions=None):
             if "effects" in option:
                 effects(option["effects"], definitions)
         choice_options(dict(prompt=event["prompt"], **{
-            f"option_{i}": options[i-1]["label"] if i <= len(options) else "" for i in range(1, 5)}))
+            f"option_{i}": options[i-1]["label"] if i <= len(options) else "" for i in range(1, 5)}), encoding=encoding)
     return deepcopy(event)
 
 
@@ -103,6 +109,10 @@ def validate_chapter_program(program):
             normalized = deepcopy(current)
             normalized[0]["kind"] = "Scene"
             normalized[-1] = {"kind": "End"}
+            normalized = [dict(kind="Transition", method="reveal", duration_ms=BOUNDARY_MS)
+                          if e["kind"] == "GuiChapterReady" else e for e in normalized]
+            if sum(e["kind"] == "GuiChapterReady" for e in current) > 1:
+                raise ValueError("场景开场完成标记重复。")
             validate_track_structure(normalized)
             normal_choices = [base_event(e) if e["kind"] in TRACK_KINDS else
                               {"kind": "Wait"} if e["kind"] in CG_KINDS | AUDIO_KINDS | LOGIC_KINDS | ACTOR_KINDS | BG_KINDS | BLUR_KINDS else e
@@ -112,6 +122,10 @@ def validate_chapter_program(program):
                 raise ValueError("本场景的分支已结束并清场；请把场景级选项放到下一场景，或让分支先汇合。")
             blocks.append(current)
             current = None
+        elif kind == "GuiChapterReady":
+            if set(event) != {"kind"}:
+                raise ValueError("场景开场完成标记不能携带任意参数。")
+            current.append(dict(kind=kind))
         else:
             parser = (lambda k, f: logic_values(k, f, definitions)) if kind in LOGIC_KINDS else (
                       blur_values if kind in BLUR_KINDS else bg_values if kind in BG_KINDS else actor_values if kind in ACTOR_KINDS else cg_values if kind in CG_KINDS else audio_values if kind in AUDIO_KINDS else
@@ -139,13 +153,17 @@ def validate_chapter_program(program):
 class GuiChapterEmitter(GuiAudioEmitter):
     choice_validation_branch_kinds = BRANCH_EVENTS | LOGIC_KINDS
 
-    def __init__(self, source, clean):
+    def __init__(self, source, clean, *, transition_masks=None):
         super().__init__(source, clean)
         self.chapter_scene_entry = None
         self.chapter_finishing = False
         self.local_exit_jumps = []
         self.route_reports = []
         self.story_bank = None
+        self.transition_masks = transition_masks
+        self.mask_address = None
+        self.setup_labels, self.setup_calls = {}, []
+        self.subroutine_entries = False
 
     def reset_scene_state(self):
         # Compile-time state only. Each route already joins and clears its
@@ -169,12 +187,48 @@ class GuiChapterEmitter(GuiAudioEmitter):
         self.local_exit_jumps.append(len(self.output))
         self.output.extend(jump(0))
 
-    def transfer(self, target):
+    def boundary_after(self, transition):
+        transition = transition_values(transition)
+        duration = max(1, transition["duration_ms"])
+        if transition["type"] == "mask":
+            if self.transition_masks is None:
+                raise ValueError("输出游戏尚未绑定这个原作遮罩。")
+            if self.mask_address is None:
+                helper = bytearray()
+                self.mask_address, report = self.transition_masks.prepare(helper, append_offset=len(self.output))
+                self.output.extend(helper)
+                self.helpers["chapter_mask_transition"] = report
+            self.output.extend(self.transition_masks.code(self.mask_address, transition["mask"], duration))
+        else:
+            self.output.extend(self.native("reveal", (duration, 1)))
+        self.output.extend(self.syscall("DissolveWait", (True,)))
+        self.covered = False
+
+    def call_setup(self, target, transition):
+        at = len(self.output)
+        self.output.extend(call(0))
+        self.setup_calls.append((at, target))
+        self.boundary_after(transition)
+        at = len(self.output)
+        self.jumps.append((at, target))
+        self.output.extend(jump(0))
+        return at
+
+    def transfer(self, target, transition=None):
         # Always emit for EVERY option, including when the previous compiled
         # alternative ended covered. Compile order is not native run order.
-        self.transition(dict(method="black_out", duration_ms=BOUNDARY_MS))
+        transition = transition_values(transition)
+        if not self.subroutine_entries:
+            self.transition(dict(method="black_out", duration_ms=BOUNDARY_MS))
+        elif transition["type"] in {"black", "white"}:
+            self.transition(dict(method=transition["type"]+"_out", duration_ms=transition["duration_ms"]))
+        else:
+            self.join()
+            self.output.extend(self.syscall("DissolveWait", (True,)))
         self.cleanup()
         self.background_loaded = False
+        if self.subroutine_entries:
+            return self.call_setup(target, transition)
         at = len(self.output)
         self.jumps.append((at, target))
         self.output.extend(jump(0))
@@ -205,7 +259,8 @@ class GuiChapterEmitter(GuiAudioEmitter):
             self.output.extend(b"\x07\0\0\0\0")
             for item in option.get("effects", []):
                 self.story_bank.emit_effect(item)
-            choices.append(dict(index=number, target=option["target"], jump_offset=self.transfer(option["target"])))
+            choices.append(dict(index=number, target=option["target"],
+                jump_offset=self.transfer(option["target"], route.get("transition"))))
         struct.pack_into("<I", self.output, skipped + 1, start)
         self.speech = None
         return dict(menu_offset=start, native_result_global=98, options=choices,
@@ -219,11 +274,11 @@ class GuiChapterEmitter(GuiAudioEmitter):
         self.output.extend(b"\x07\0\0\0\0")
         names = GuiTrackChoiceEmitter.STATE
         baseline = {name: deepcopy(getattr(self, name)) for name in names}
-        yes = self.transfer(route["then"])
+        yes = self.transfer(route["then"], route.get("transition"))
         struct.pack_into("<I", self.output, skipped + 1, len(self.output))
         for name, state in baseline.items():
             setattr(self, name, deepcopy(state))
-        no = self.transfer(route["else"])
+        no = self.transfer(route["else"], route.get("transition"))
         return dict(condition_offset=start, test=deepcopy(route["test"]),
             variable_slot=self.story_bank.slots[route["test"]["variable"]],
             options=[dict(result=True, target=route["then"], jump_offset=yes),
@@ -236,7 +291,14 @@ class GuiChapterEmitter(GuiAudioEmitter):
             return True
         if kind == "GuiChapterScene":
             self.current_scene = event["scene_id"]
-            self.scene_labels[self.current_scene] = self.chapter_scene_entry
+            if not self.subroutine_entries:
+                self.scene_labels[self.current_scene] = self.chapter_scene_entry
+            return True
+        if kind == "GuiChapterReady":
+            self.join()
+            self.output.extend(b"\x04")
+            self.scene_labels[self.current_scene] = len(self.output)
+            self.covered = False
             return True
         if kind != "GuiChapterExit":
             return super().emit_extension(event, resources)
@@ -244,9 +306,10 @@ class GuiChapterEmitter(GuiAudioEmitter):
         for at in self.local_exit_jumps:
             struct.pack_into("<I", self.output, at + 1, exit_at)
         report = dict(scene_id=self.current_scene, mode=event["mode"], exit_offset=exit_at,
+                      transition=transition_values(event.get("transition")),
                       local_branch_exit_jumps=list(self.local_exit_jumps))
         if event["mode"] in ("next", "jump"):
-            report.update(target=event["target"], jump_offset=self.transfer(event["target"]))
+            report.update(target=event["target"], jump_offset=self.transfer(event["target"], event.get("transition")))
         elif event["mode"] == "choice":
             report.update(self.scene_choice(event))
         elif event["mode"] == "condition":
@@ -267,21 +330,35 @@ class GuiChapterEmitter(GuiAudioEmitter):
         if not finalize_jumps:
             raise ValueError("章节必须一次生成完整的连线。")
         blocks = validate_chapter_program(program)
+        ready_counts = [sum(e["kind"] == "GuiChapterReady" for e in b) for b in blocks]
+        if any(ready_counts) and any(n != 1 for n in ready_counts):
+            raise ValueError("章节的开场子程序标记不一致。")
+        self.subroutine_entries = bool(any(ready_counts))
+        if not self.subroutine_entries and any("transition" in b[-1] for b in blocks):
+            raise ValueError("带衔接设置的章节需要完整开场子程序，不能按旧黑场程序输出。")
         if program.get("variables"):
             self.story_bank = StoryVariableBank(self, program["variables"])
             self.story_bank.initialize()
+        self.prepare_audio([event for block in blocks for event in block], resources)
         # An end scene can appear before a music-using branch in storage order.
         # All chapter ends therefore make the same stop decision, never a
         # decision derived from whichever alternative was compiled first.
         self.gui_audio_used = any(e["kind"] in AUDIO_KINDS for block in blocks for e in block)
         self.gui_voice_used = any(e["kind"] == "GuiVoiceLine" for block in blocks for e in block)
         self.transition(dict(method="black_out", duration_ms=BOUNDARY_MS))
+        if self.subroutine_entries:
+            self.call_setup(program["entry_scene_id"], None)
         for block in blocks:
             self.reset_scene_state()
+            if self.subroutine_entries:
+                self.setup_labels[block[0]["scene_id"]] = len(self.output)
+                self.output.extend(b"\x01\0\0")
             self.chapter_scene_entry = len(self.output)
             # The base prelude is included in the label; it is not skipped when
             # revisiting a scene or entering from a backward/cross-order edge.
             super().compile({**program, "events": block}, resources, finalize_jumps=False)
+        for at, target in self.setup_calls:
+            struct.pack_into("<I", self.output, at + 1, self.setup_labels[target])
         for at, target in self.jumps:
             struct.pack_into("<I", self.output, at + 1, self.scene_labels[target])
         self.output[ENTRY:ENTRY + 5] = jump(self.entry)

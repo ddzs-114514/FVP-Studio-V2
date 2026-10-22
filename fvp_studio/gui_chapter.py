@@ -11,6 +11,7 @@ from .gui_native_preflight import (MAX_BYTES, PROJECT_SCHEMA, SCENE_RE, FrozenRe
                                    SceneBuilder, canonical, checksum, ident, object_only)
 from .gui_runtime import GuiRuntimeError
 from .gui_story_logic import effects, predicate, route_targets, variables
+from .gui_chapter_transition import transition_values
 
 PLAN_SCHEMA = "fvp-gui-chapter-plan/1"
 PROGRAM_SCHEMA = "fvp-gui-chapter-program/1"
@@ -90,9 +91,16 @@ def chapter_plan(document, chapter_id):
         allowed = ({"type", "target"} if kind == "jump" else
                    {"type", "prompt", "options"} if kind == "choice" else
                    {"type", "test", "then", "else"} if kind == "condition" else {"type"})
-        if set(exit_) != allowed:
+        if set(exit_) not in (allowed, allowed | {"transition"}):
             reject("invalid_exit", "场景出口的设置不完整，请重新设置。", chapter_id=cid, scene_id=sid)
         route = dict(scene_id=sid, mode=kind, target=None, prompt="", options=[])
+        if "transition" in exit_:
+            try:
+                if exit_["transition"] is None:
+                    raise ValueError("衔接设置不能为 null。")
+                route["transition"] = transition_values(exit_["transition"])
+            except ValueError as exc:
+                reject("invalid_transition", str(exc), chapter_id=cid, scene_id=sid, field="exit.transition")
         if kind == "next":
             members, index = indexed[cid]["scenes"], indexes[sid]
             route["target"] = members[index + 1] if index + 1 < len(members) else None
@@ -175,7 +183,8 @@ def chapter_plan(document, chapter_id):
                 routes=[deepcopy(routes[s]) for s in included], warnings=warnings,
                 original_game_written=False, candidate_generated=False,
                 scene_boundary=dict(colour="black", duration_ms=BOUNDARY_MS,
-                                    reset="scene_setup", preserve_audio=True))
+                                    reset="scene_setup", preserve_audio=True,
+                                    default_only=True, per_exit_field="transition"))
 
 
 def chapter_snapshot(request):
@@ -225,7 +234,7 @@ class ChapterBuilder:
             initial_end = next((m["event_indexes"][0] for m in builder.mapping if "beat_id" in m), len(block["events"]) - 1)
             body = deepcopy(block["events"][:-1])
             body[0]["kind"] = "GuiChapterScene"
-            body.insert(initial_end, dict(kind="Transition", method="reveal", duration_ms=BOUNDARY_MS))
+            body.insert(initial_end, dict(kind="GuiChapterReady"))
             body.append(dict(kind="GuiChapterExit", **deepcopy(routes[sid])))
             events.extend(body)
             for m in builder.mapping:

@@ -62,7 +62,7 @@ class ReleaseTests(unittest.TestCase):
     def test_all_modules_import_without_external_workspace(self):
         script = "import sys,pkgutil,importlib;sys.path.insert(0,sys.argv[1]);import fvp_studio;mods=[m.name for m in pkgutil.walk_packages(fvp_studio.__path__,fvp_studio.__name__+'.')];[importlib.import_module(m) for m in mods];assert not any(n in sys.modules for n in ('hzc_template_codec','build_bin_patch','inspect_assets','index_visual_assets'));print('ISOLATED_IMPORT',len(mods))"
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
-        result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT)], cwd=self.root,
+        result = subprocess.run([sys.executable, "-X", "utf8", "-I", "-B", "-c", script, str(ROOT)], cwd=self.root,
                                 env=env, check=True, capture_output=True, text=True, encoding="utf-8")
         self.assertIn("ISOLATED_IMPORT", result.stdout)
 
@@ -89,6 +89,42 @@ class ReleaseTests(unittest.TestCase):
             lb.require_binding()
         with self.assertRaises(ValueError):
             lb.validate_binding(json.loads((ROOT / "examples/hoshi_binding.example.json").read_text()))
+
+    def test_new_pattern_globals_are_lazy_but_missing_config_still_rejects(self):
+        module = importlib.import_module("fvp_studio.native_cg_motion_stop_binding")
+        self.assertNotIn("_HANDLER", module.__dict__)
+        with self.assertRaisesRegex(ValueError, "本机引擎识别签名"):
+            getattr(module, "_HANDLER")
+        with mock.patch.object(module, "engine_pattern", return_value=b"owned-synthetic-pattern") as lookup:
+            value = getattr(module, "_HANDLER")
+            self.assertEqual(getattr(value, "pattern", value), b"owned-synthetic-pattern")
+            lookup.assert_called_once()
+
+    def test_private_pattern_preparer_reads_literals_without_executing_code(self):
+        from fvp_studio import prepare_local
+        reader = self.root / "reader"
+        reader.mkdir()
+        text = "raise AssertionError('reader must not execute')\nA = b'owned-test-one'\nB = bytes.fromhex('6f776e65642d746573742d74776f')\n"
+        (reader / "toy.py").write_text(text, encoding="utf-8")
+        approved = {}
+        for node in ast.walk(ast.parse(text)):
+            data = None
+            if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+                data = node.value
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "fromhex":
+                data = bytes.fromhex(node.args[0].value)
+            if data is not None:
+                approved[f"toy:{node.lineno}:{node.col_offset}"] = hashlib.sha256(data).hexdigest()
+        with mock.patch.object(prepare_local, "APPROVED", approved), mock.patch.object(ep, "APPROVED", approved):
+            result = prepare_local.collect_patterns(reader)
+            self.assertEqual(set(result["patterns"]), set(approved))
+
+    def test_original_call_table_cli_help_needs_no_game_or_private_signature(self):
+        script = "import sys;sys.path.insert(0,sys.argv[1]);from fvp_studio.original_call_table import main;main(['--help'])"
+        result = subprocess.run([sys.executable, "-X", "utf8", "-I", "-B", "-c", script, str(ROOT)],
+                                cwd=self.root, capture_output=True, check=True)
+        self.assertIn(b"--hcb", result.stdout)
+        self.assertIn(b"--output", result.stdout)
 
     def test_read_access_time_change_is_not_content_drift(self):
         from types import SimpleNamespace

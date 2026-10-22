@@ -14,23 +14,52 @@ from .performance_compile import jump, sha
 KINDS = {"GuiBGM", "GuiSE", "GuiVoiceLine"}
 
 
+def playback_contract(kinds):
+    """Generic exporter only; target binding still decides which kinds exist."""
+    return dict(schema="fvp-native-audio-playback/1",
+        operations={k: (["play", "keep", "restart", "volume", "stop"] if k == "bgm"
+                        else ["play", "stop"]) for k in kinds if k in ("bgm", "se")},
+        bgm_same_asset_play="keep_until_explicit_stop_or_restart",
+        bgm_fade_in_field="fade_in_ms", bgm_old_fade_field="duration_ms",
+        authoring_fade_in_field="fadeInMs", duration_ms_range=[0,6000],
+        bgm_true_fade_in="bgm" in kinds, se_loop="se" in kinds,
+        se_stop_scope="all_target_normal_se_slots", se_allocator="target_original",
+        same_asset_parameter_changes="use_volume_or_restart",
+        replay_after_natural_end="explicit_restart",
+        volume_duration_zero_policy="target_native_not_envelope_cancel",
+        se_loop_ends=["explicit_stop", "native_slot_replacement", "owned_program_end"],
+        cross_line_continuity=True, cross_scene_continuity=True,
+        voice_line_playback='voice' in kinds, voice_backlog_replay=False,
+        voice_native_wait='voice' in kinds, voice_stop_on_line_advance=True,
+        waits_for_audio=False, runtime_verified=False)
+
+
 def event_values(kind, fields):
     if kind == "GuiVoiceLine":
         from .gui_voice_program import event_values as voice_values
         return voice_values(fields)
-    if kind not in KINDS or set(fields) != {"op", "source", "archive", "resource", "sha256",
-                                           "volume", "loop", "duration_ms"}:
+    required = {"op", "source", "archive", "resource", "sha256", "volume", "loop", "duration_ms"}
+    allowed = required | ({"fade_in_ms"} if kind == "GuiBGM" else set())
+    if kind not in KINDS or not required <= set(fields) <= allowed:
         raise ValueError("声音指令字段不完整。")
-    if fields["op"] not in ("play", "stop"):
-        raise ValueError("声音操作只能是播放或停止。")
+    operations = ("play", "restart", "keep", "volume", "stop") if kind == "GuiBGM" else ("play", "stop")
+    if fields["op"] not in operations:
+        raise ValueError("声音操作不受支持。")
     for key, high in (("volume", 100), ("duration_ms", 6000)):
         if type(fields[key]) is not int or not 0 <= fields[key] <= high:
             raise ValueError("声音音量或切换时间不正确。")
-    if type(fields["loop"]) is not bool or kind == "GuiSE" and fields["loop"]:
-        raise ValueError("循环设置不正确；音效不循环。")
-    if fields["op"] == "stop":
+    fade = fields.get("fade_in_ms", 0)
+    if type(fade) is not int or not 0 <= fade <= 6000:
+        raise ValueError("音乐淡入时间须为 0～6000 毫秒。")
+    if type(fields["loop"]) is not bool:
+        raise ValueError("循环设置须为布尔值。")
+    if fields["op"] not in ("play", "restart"):
         if any(fields[key] is not None for key in ("source", "archive", "resource", "sha256")):
-            raise ValueError("停止声音不能附带素材引用。")
+            raise ValueError("保持、调音量或停止声音不能附带素材引用。")
+        if fields["loop"] or fade:
+            raise ValueError("保持、调音量或停止声音不能设置循环或新曲淡入。")
+        if fields["op"] == "keep" and fields["duration_ms"]:
+            raise ValueError("保持音乐不提交渐变，请将时间设为 0。")
     else:
         if (not isinstance(fields["source"], str) or not ID_RE.fullmatch(fields["source"])
                 or not isinstance(fields["sha256"], str) or not SHA_RE.fullmatch(fields["sha256"])
@@ -59,6 +88,16 @@ class GuiAudioEmitter(GuiCgEmitter):
             self.call_table[name] = address, arity
         self.gui_audio_used = False
         self.gui_voice_used = False
+        self.legacy_audio_program = None
+
+    def prepare_audio(self, events, resources):
+        if self.legacy_audio_program is None and any(e['kind'] in {'GuiBGM', 'GuiSE'} for e in events):
+            from .gui_legacy_audio import LegacyAudioProgram
+            self.legacy_audio_program = LegacyAudioProgram(self, events, resources)
+
+    def compile(self, program, resources, *, finalize_jumps=True):
+        self.prepare_audio(program['events'], resources)
+        return super().compile(program, resources, finalize_jumps=finalize_jumps)
 
     def asset_bgm_helper(self):
         """Reuse 4442's actual loader/two-channel tail, bypass only its ID table.
@@ -116,20 +155,9 @@ class GuiAudioEmitter(GuiCgEmitter):
         if kind not in KINDS:
             return super().emit_extension(event, resources)
         fields = event_values(kind, {k: v for k, v in event.items() if k != "kind"})
-        prefix = "gui_bgm_" if kind == "GuiBGM" else "gui_se_"
-        if fields["op"] == "stop":
-            self.output.extend(self.native(prefix + "stop", (fields["duration_ms"],)))
-        else:
-            binding = resources.audio(event)
-            native_id = binding["native_id"]
-            if kind == "GuiBGM":
-                self.asset_bgm_helper()
-                directory = "BGM2/" if binding["target_archive"] == "bgm2.bin" else "BGM/"
-                self.output.extend(self.native("gui_bgm_asset_play", (directory + binding["target_resource"],
-                    native_id, fields["duration_ms"], fields["loop"], fields["volume"], True)))
-            else:
-                self.output.extend(self.native(prefix + "play", (native_id, fields["duration_ms"],
-                                                               True, fields["volume"])))
+        if self.legacy_audio_program is None:
+            raise ValueError('声音程序须在场景或章节入口统一初始化。')
+        self.legacy_audio_program.emit(dict(kind=kind, **fields))
         self.gui_audio_used = True
         return True
 
@@ -138,7 +166,6 @@ class GuiAudioEmitter(GuiCgEmitter):
             from .gui_voice_program import stop_helper
             stop_helper(self)
             self.output.extend(self.native("gui_voice_stop"))
-        if self.gui_audio_used:
-            self.output.extend(self.native("gui_bgm_stop", (0,)))
-            self.output.extend(self.native("gui_se_stop", (0,)))
+        if self.legacy_audio_program is not None:
+            self.legacy_audio_program.finish()
         return super().resume_original()

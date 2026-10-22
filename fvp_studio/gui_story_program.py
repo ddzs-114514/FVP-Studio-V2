@@ -14,6 +14,7 @@ from .portrait_emitter import _encode_push
 class StoryVariableBank:
     def __init__(self, emitter, definitions):
         self.e = emitter
+        self.address_base = 0
         self.definitions = variables(definitions)
         header = emitter.document.header
         table = struct.unpack_from("<I", emitter.source)[0]
@@ -35,6 +36,7 @@ class StoryVariableBank:
         self.total_before = total
         self.max_original_direct_global = max(referenced, default=-1)
         self.initialization = None
+        self.private_groups = []
 
     def initialize(self):
         # Only the test/story ENTRY reaches this once. Scene labels and backward
@@ -44,6 +46,25 @@ class StoryVariableBank:
         for key in sorted(self.definitions):
             self.set_value(key, self.definitions[key]["initial"])
         self.initialization = [start, len(self.e.output)]
+
+    def reserve_private(self, count, scope):
+        """Share the candidate tail with internal state, never user variables."""
+        if (self.initialization is None or type(count) is not int or not 1 <= count <= 64
+                or not isinstance(scope, str) or not scope
+                or any(group['scope'] == scope for group in self.private_groups)):
+            raise ValueError("私有状态分配不完整或重复。")
+        start = self.total_before + self.after - self.before
+        if start + count > 65535 or self.after + count > 65535:
+            raise ValueError("脚本变量表已满，不能添加私有状态。")
+        if struct.unpack_from('<H', self.e.output, self.header_offset)[0] != self.after:
+            raise ValueError("私有状态分配前脚本变量表发生变化。")
+        group = dict(scope=scope, private_global_ids=list(range(start, start + count)))
+        self.after += count
+        struct.pack_into('<H', self.e.output, self.header_offset, self.after)
+        for slot in group['private_global_ids']:
+            self.e.output.extend(b'\x08\x15' + struct.pack('<H', slot))
+        self.private_groups.append(group)
+        return deepcopy(group)
 
     def load(self, key):
         return b"\x0f" + struct.pack("<H", self.slots[key])
@@ -72,13 +93,16 @@ class StoryVariableBank:
             at = len(self.e.output)
             self.e.output.extend(b"\x07\0\0\0\0")
             self.set_value(key, bound)
-            struct.pack_into("<I", self.e.output, at + 1, len(self.e.output))
+            struct.pack_into("<I", self.e.output, at + 1, self.address_base + len(self.e.output))
 
     def validate_header(self, payload):
         if struct.unpack_from("<H", payload, self.header_offset)[0] != self.after:
             raise ValueError("剧情变量表长度与分配结果不一致。")
         if self.initialization is None or set(self.slots) != set(self.definitions):
             raise ValueError("剧情变量没有正确初始化。")
+        if self.after - self.before != len(self.slots) + sum(
+                len(group['private_global_ids']) for group in self.private_groups):
+            raise ValueError("私有状态数量与变量表不一致。")
         return self.header_offset, struct.pack("<H", self.before)
 
     def report(self):
@@ -88,6 +112,7 @@ class StoryVariableBank:
             header_changes=[] if self.before == self.after else [dict(offset=self.header_offset,
                 field="volatile_globals", before=self.before, after=self.after)],
             initialization=self.initialization, reset_on_scene_entry=False,
+            private_groups=deepcopy(self.private_groups),
             original_variable_slots_unchanged=True, non_volatile_globals_unchanged=True,
             integer_range=[-INT_LIMIT, INT_LIMIT], integer_add_policy="saturate",
             runtime_verified=False, save_load_verified=False, rewind_verified=False)

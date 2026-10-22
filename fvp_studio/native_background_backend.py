@@ -291,11 +291,14 @@ class NativeBackgroundBackend:
 
     def compile_load(self, document: HcbDocument, *, resource_name: str,
                      archive_name: str, duration_ms: int,
-                     blur_resource_name: str | None = None) -> NativeBackgroundCalls:
+                     blur_resource_name: str | None = None,
+                     transition: bool = True) -> NativeBackgroundCalls:
         if document.source_sha256 != self.source_sha256 or document.original_bytes != self._source.original_bytes:
             raise NativeBackgroundBackendError("背景调用属于另一份目标 HCB，不能复用")
         if type(duration_ms) is not int or not 0 <= duration_ms <= 60000:
             raise NativeBackgroundBackendError("背景转场时间必须是 0～60000 毫秒整数")
+        if type(transition) is not bool or not transition and duration_ms:
+            raise NativeBackgroundBackendError("保持黑白场时只能直接加载背景，不能暗中启动背景渐变")
         archive = str(archive_name).strip().casefold()
         if archive not in self.archive_selectors:
             raise NativeBackgroundBackendError("背景归档不在当前目标的原生资源路由中")
@@ -316,11 +319,12 @@ class NativeBackgroundBackend:
             calls.append({"address": self.blur_target, "arguments": [blur, *tail]})
             code += _push_string(blur, document.encoding) + _arguments(tail) + _call(self.blur_target)
         dissolve = [0, duration_ms, *([None] * (self.dissolve_argument_count - 2))]
-        calls.append({"address": self.dissolve_target, "arguments": dissolve})
-        code += _arguments(dissolve) + _call(self.dissolve_target)
+        if transition:
+            calls.append({"address": self.dissolve_target, "arguments": dissolve})
+            code += _arguments(dissolve) + _call(self.dissolve_target)
         return NativeBackgroundCalls(code, {
             **self.describe(), "resource_name": resource_name,
             "runtime_blur_resource_name": blur, "archive_name": archive,
-            "duration_ms": duration_ms, "calls": calls,
+            "duration_ms": duration_ms, "transition_emitted": transition, "calls": calls,
             "code_sha256": hashlib.sha256(code).hexdigest(), "byte_count": len(code),
         })

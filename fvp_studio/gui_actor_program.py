@@ -19,10 +19,12 @@ def number(value, low, high, label, *, integer=False):
 def event_values(kind, fields):
     if kind == "GuiActorSwap":
         if (not {"portrait", "policy"} <= set(fields)
-                or set(fields) - {"portrait", "policy", "duration_ms"}
+                or set(fields) - {"portrait", "policy", "duration_ms", "target_alpha"}
                 or fields["policy"] not in ("keep", "source")):
             raise ValueError("换身体需要明确的新素材和大小策略。")
         number(fields.get("duration_ms", 0), 0, 6000, "换装时长", integer=True)
+        if 'target_alpha' in fields:
+            number(fields['target_alpha'],0,255,'换装目标透明度',integer=True)
         portrait = fields["portrait"]
         if not isinstance(portrait, dict):
             raise ValueError("换身体参数不正确。")
@@ -74,12 +76,15 @@ def emit_actor(emitter, event, resources):
         previous = emitter.actors.get(portrait["actor"])
         if previous is None:
             raise ValueError("换身体的角色尚未入场。")
-        portrait["alpha"] = previous["alpha"]
+        portrait["alpha"] = event.get('target_alpha',previous["alpha"])
         if event.get("duration_ms", 0) > 0:
             emitter.actor_swap_blend.start(portrait, resources, event["policy"], event["duration_ms"])
         else:
             emitter.portrait(portrait, resources, replacing=True,
                              keep=event["policy"] == "keep", keep_position=True)
+            if 'target_alpha' in event:
+                emitter.output.extend(emitter.syscall('PrimSetAlpha',(PRIMS[portrait['actor']],portrait['alpha'])))
+                emitter.actors[portrait['actor']]['alpha']=portrait['alpha']
         return True
     actor = event["actor"]
     if actor not in emitter.actors or emitter.cg is not None:

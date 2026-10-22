@@ -22,11 +22,15 @@ from .performance_compile import (Emitter, SOURCE_SHA, CLEAN_SHA, EXE_SHA,
 from .performance_portrait_limits import checked_portrait_scale
 from .performance_choices import choice_options
 from .gui_actor_program import KINDS as ACTOR_KINDS, event_values as actor_values
+from .gui_cg_stage_handoff import POSE_KIND, POSE_ACTIONS, pose_values
+from .gui_actor_sway import (KINDS as SWAY_KINDS, START as SWAY_START, STOP as SWAY_STOP,
+    authored as sway_authored, event_values as sway_values, plan_tracks as sway_plan_tracks)
 from .gui_background_program import KINDS as BG_KINDS, event_values as bg_values, report as background_report
 from .gui_background_blur import KINDS as BLUR_KINDS, event_values as blur_values, report as blur_report
 from .gui_choice_tracks import (SCHEMA as TRACK_PROGRAM_SCHEMA, CONTRACT as TRACK_CONTRACT,
     KINDS as TRACK_KINDS, event_values as track_event_values)
 from .performance_workflow import SCHEMA as PROGRAM_SCHEMA, values, digest
+from .camera_zoom_limits import ZOOM_MIN, ZOOM_SCHEMA_MAX
 from .gui_native_cg import (SCHEMA as CG_PROGRAM_SCHEMA, CONTRACT as CG_CONTRACT,
     KINDS as CG_KINDS, GuiCgEmitter, event_values as cg_event_values,
     validate_gui_program, cg_scale)
@@ -168,7 +172,8 @@ class GuiNativePreflight:
 
 
 class SceneBuilder:
-    def __init__(self, runtime, project, scene, *, story_variables=None, native_export_target=False):
+    def __init__(self, runtime, project, scene, *, story_variables=None, native_export_target=False,
+                 native_rotation_converter=None):
         self.runtime, self.project, self.scene = runtime, project, scene
         # Chapter/story generation owns initialization and shared route state.
         # An isolated scene must not silently drop those semantics.
@@ -176,8 +181,13 @@ class SceneBuilder:
         # Only the separate generic new-copy exporter opts into portable event
         # translation. This does not widen the Hoshi preflight/emitter gate.
         self.native_export_target = native_export_target
+        self.native_rotation_converter = native_rotation_converter
+        self.rotation_conversions = []
         self.issues, self.mapping = [], []
         self.events, self.resources = [], FrozenResources()
+        self.native_parallel_swaps = []
+        self.native_parallel_motion = []
+        self.native_parallel_cg = []
         self.actors, self.bodies, self.parameters, self.present = {}, {}, {}, set()
         self.actor_bindings = {}
         self.body_defs, self.verified = {}, {}
@@ -189,6 +199,7 @@ class SceneBuilder:
         self.background_asset_id, self.background_blur_state = None, None
         self.covered = False
         self.beat_ids, self.track_ids = set(), set()
+        self.sway_plan = dict(starts={}, stops={})
 
     @property
     def has_errors(self):
@@ -210,11 +221,30 @@ class SceneBuilder:
         from .gui_story_logic import KINDS as LOGIC_KINDS, event_values as logic_values
         parser = (lambda k, f: logic_values(k, f, self.story_variables or {}) if k in LOGIC_KINDS else
                   actor_values(k, f) if k in ACTOR_KINDS else audio_values(k, f) if k in AUDIO_KINDS else
-                  track_event_values(k, f) if k in TRACK_KINDS else
+                  track_event_values(k, f, encoding=None if self.native_export_target else "gbk") if k in TRACK_KINDS else
                   bg_values(k, f) if k in BG_KINDS else
                   blur_values(k, f) if k in BLUR_KINDS else
                   cg_event_values(k, f) if k in CG_KINDS else values(k, f))
-        event = {"kind": kind, **parser(kind, fields or {})}
+        if kind == 'GuiVoiceLine' and self.native_export_target:
+            from .gui_voice_program import event_values as voice_values
+            parsed = voice_values(fields, encoding=None)
+        elif kind in SWAY_KINDS:
+            if not self.native_export_target:
+                raise ValueError('持续摇摆须使用目标绑定的原生导出，不支持旧固定 ABI 入口。')
+            parsed = sway_values(kind, fields)
+        elif kind == POSE_KIND:
+            if not self.native_export_target or not self.covered or self.cg_state is not None:
+                raise ValueError("直接设置角色姿态只用于通用输出的黑／白场遮盖内。")
+            parsed = pose_values(fields)
+        elif (self.native_export_target and self.covered and kind == "CameraShot"
+                and fields is not None and type(fields.get("duration_ms")) is int and fields["duration_ms"] == 0):
+            # Validate ordinary framing fields, but lower this covered setup
+            # through the target's native reset wrapper, never Motion(0).
+            parsed = values(kind, dict(fields, duration_ms=200))
+            parsed["duration_ms"] = 0
+        else:
+            parsed = parser(kind, fields or {})
+        event = {"kind": kind, **parsed}
         if len(self.events) >= 500:
             raise ValueError("原生事件数超过 500")
         self.mapping.append(dict(scene_id=self.scene["id"], **self.location,
@@ -285,6 +315,9 @@ class SceneBuilder:
             beats = self.scene.get("beats")
             if not isinstance(beats, list) or not 1 <= len(beats) <= 100:
                 raise ValueError("当前场景节拍数须为 1～100")
+            self.sway_plan = sway_plan_tracks(beats)
+            if self.sway_plan['starts'] and not self.native_export_target:
+                raise ValueError('持续摇摆须使用目标绑定的原生导出。')
             action_ids = set()
             for index, beat in enumerate(beats):
                 following = beats[index+1] if index+1 < len(beats) else None
@@ -296,10 +329,12 @@ class SceneBuilder:
             self.location = {}
             from .gui_audio_program import KINDS as AUDIO_KINDS
             schema = (TRACK_PROGRAM_SCHEMA if any(e["kind"] in TRACK_KINDS for e in self.events)
-                      else CG_PROGRAM_SCHEMA if any(e["kind"] in CG_KINDS | AUDIO_KINDS | ACTOR_KINDS | BG_KINDS | BLUR_KINDS for e in self.events)
+                      else CG_PROGRAM_SCHEMA if any(e["kind"] in CG_KINDS | AUDIO_KINDS | ACTOR_KINDS | BG_KINDS | BLUR_KINDS | SWAY_KINDS for e in self.events)
                       else PROGRAM_SCHEMA)
-            return dict(schema=schema, source_root=str(self.root),
-                        title=title, events=self.events)
+            return dict(schema=schema, source_root=str(self.root), title=title, events=self.events,
+                **(dict(native_parallel_swaps=self.native_parallel_swaps) if self.native_parallel_swaps else {}),
+                **(dict(native_parallel_motion=self.native_parallel_motion) if self.native_parallel_motion else {}),
+                **(dict(native_parallel_cg=self.native_parallel_cg) if self.native_parallel_cg else {}))
         except GuiRuntimeError as exc:
             self.issue("error", exc.code, str(exc))
         except (ValueError, TypeError, KeyError) as exc:
@@ -315,11 +350,89 @@ class SceneBuilder:
             if bid in self.beat_ids:
                 raise ValueError("节拍 ID 重复（包括各选项轨道）")
             self.beat_ids.add(bid)
-            if location is not None and beat.get("kind") == "choice":
+            for stop in self.sway_plan['stops'].get(bid, ()):
+                self.add(SWAY_STOP, dict(actor=self.actors[stop['target']][0],
+                    loop_id=self.scene['id'] + '_' + stop['action_id']))
+            if location is not None and beat.get("kind") == "choice" and not self.native_export_target:
                 raise ValueError("本轮分支轨道内还不能再嵌套选项")
             self.beat(beat, action_ids)
+            if self.native_export_target:
+                self.bind_parallel_swap_beat(bid)
+                self.bind_parallel_motion_beat(bid)
         except (ValueError, KeyError, TypeError) as exc:
             self.issue("error", "invalid_beat", str(exc), field=self.location.get("field", "beats"))
+
+    def bind_parallel_swap_beat(self, beat_id):
+        # Mapping identities, not a contiguous slice: a choice beat contains
+        # nested route events that must keep their own launch boundaries.
+        own = sorted({i for row in self.mapping if row.get('beat_id') == beat_id
+                      for i in row['event_indexes']})
+        swaps = [i for i in own if self.events[i]['kind']=='GuiActorSwap'
+                 and self.events[i].get('duration_ms',0)>0]
+        if not swaps:
+            return
+        motion_indexes = [i for i in own if self.events[i]['kind'] in {
+            'Action','GuiActorMove','GuiActorSlide','CameraShot','GuiBackgroundBlur'}]
+        swap_actors = {self.events[i]['portrait']['actor'] for i in swaps}
+        slides = [i for i in motion_indexes if self.events[i]['kind']=='GuiActorSlide']
+        for i in slides:
+            actor = self.events[i]['actor']
+            if actor in swap_actors or any(j!=i and self.events[j].get('actor')==actor for j in motion_indexes):
+                raise ValueError('换装同拍的滑入滑出仅用于其他角色；滑动角色的其他动作请分拍，不会串行代替。')
+        if len(swaps) > 1 or any(self.events[i].get('actor') not in swap_actors for i in motion_indexes):
+            other = [i for i in own if self.events[i]['kind'] in {
+                'Action','GuiActorMove','GuiActorSlide','CameraShot','GuiBackgroundBlur','Portrait','Hide'}
+                or self.events[i]['kind']=='GuiActorSwap' and i not in swaps]
+            for i in other:
+                event = self.events[i]
+                if event['kind'] in {'CameraShot','GuiBackgroundBlur'}:
+                    continue
+                if event['kind']=='GuiActorSlide':
+                    continue  # XY and alpha launch together at the native apply frontier.
+                if event['kind']=='Portrait' and i<swaps[0]:
+                    continue  # Other entrants are prepared before the shared launch.
+                if event['kind']=='Hide' and any(self.events[j]['kind'] in {'Text','Speech','Wait'}
+                        for j in own if swaps[0]<j<i):
+                    continue  # Authored post-line/wait retirement stays outside the batch.
+                if (event.get('actor') is None or event['kind'] not in {'Action','GuiActorMove'}
+                        or event['kind']=='Action' and set(event['channels'].split('+'))-(
+                            {'s2','z','r'} if event['actor'] in swap_actors else {'s2','z','r','alpha'})):
+                    raise ValueError('这批换装支持角色运动、镜头和背景模糊；其他通道尚未接通，不会串行播放后声称并行。')
+            other = [i for i in other if self.events[i]['kind'] not in {'Portrait','Hide'}]
+            self.native_parallel_swaps.append(dict(swap_index=swaps[0],swap_indexes=swaps,
+                action_indexes=other,beat_id=beat_id))
+            return
+        index = swaps[0]
+        actor = self.events[index]['portrait']['actor']
+        actions = [i for i in own if self.events[i]['kind'] in {'Action','GuiActorMove','GuiActorSlide','CameraShot','GuiBackgroundBlur'}]
+        if not actions:
+            return
+        for i in actions:
+            event = self.events[i]
+            if (event.get('actor') != actor or event['kind'] not in {'Action','GuiActorMove'}
+                    or event['kind']=='Action' and set(event['channels'].split('+'))-{'s2','z','r'}):
+                raise ValueError("换装同拍暂先接同角色移动、倾斜、缩放和景深；其他并行提交尚未接齐，不会悄悄排队。")
+        self.native_parallel_swaps.append(dict(swap_index=index, action_indexes=actions, beat_id=beat_id))
+
+    def bind_parallel_motion_beat(self, beat_id):
+        from .native_portrait_motion_group import bind_motion_groups
+        own = sorted({i for row in self.mapping if row.get('beat_id') == beat_id
+                      for i in row['event_indexes']})
+        if any(self.events[i]['kind'] == 'GuiActorSwap' for i in own):
+            return  # Both instant and blended swaps keep their own admission.
+        motion = [i for i in own if self.events[i]['kind'] in {'Action', 'GuiActorMove'}]
+        channels = {}
+        for i in motion:
+            event = self.events[i]
+            channels.setdefault(event['actor'], set()).update(
+                ['xy'] if event['kind'] == 'GuiActorMove' else event['channels'].split('+'))
+        if not any('xy' in row and row.intersection({'s2', 'z'}) for row in channels.values()):
+            return
+        if any(self.events[i]['kind'] not in {'Action', 'GuiActorMove', 'Text', 'Speech', 'Wait'} for i in own):
+            raise ValueError('普通同拍变换先只接台词和等待节拍，不能混入场景或选项切换。')
+        group = dict(beat_id=beat_id, action_indexes=motion)
+        bind_motion_groups(self.events, [group])
+        self.native_parallel_motion.append(group)
 
     def background_reference(self, asset_id):
         graphics = object_only(self.project.get("externalGraphics", {}), "原作背景登记")
@@ -382,12 +495,13 @@ class SceneBuilder:
         # Native loading preserves the current actor geometry and V3D pose.
         # In particular, do not reuse background()'s opening-camera reset.
 
-    def background_blur_action(self, action, valid):
+    def background_blur_action(self, action, valid, *, covered_setup=False):
         from .native_background_pairs import lookup
         self.check_fields(action["p"], ("amount",), "背景模糊参数")
         if action["target"] != "stage" or self.background_state is None or self.cg_state is not None:
             raise ValueError("背景模糊作用于普通背景；请先让 CG 退场并换回背景。")
-        if any(a["type"] in ("bg", "cg", "cgxf", "cgexit") for a in valid):
+        if (not covered_setup and
+                any(a["type"] in ("bg", "cg", "cgxf", "cgexit") for a in valid)):
             raise ValueError("请先换好背景，再在下一拍调节背景模糊。")
         if action["dur"] and self.covered:
             raise ValueError("黑白场下请直接设置模糊，再用淡入恢复画面。")
@@ -544,7 +658,7 @@ class SceneBuilder:
                 if action.get("curve") not in (2, 3):
                     raise ValueError("动作曲线须为 2 或 3")
                 target, typ = action.get("target"), action.get("type")
-                channel = {"enter":"alpha", "exit":"alpha", "fade":"alpha", "expr":"parts", "scale":"s2", "move":"xy", "depth":"z", "tilt":"r", "swap":"body", "camera":"camera", "bg":"bg",
+                channel = {"enter":"alpha", "exit":"alpha", "fade":"alpha", "expr":"parts", "scale":"s2", "move":"xy", "depth":"z", "tilt":"r", "sway":"r", "swap":"body", "camera":"camera", "bg":"bg",
                     "bgblur":"bgblur", "cg":"cg", "cgexit":"cg", "cgxf":"cgxf", "bgm":"bgm", "se":"se"}.get(typ)
                 if channel is None:
                     self.issue("error", "unsupported_action", f"{typ} 尚未接入原生预检；保留 GUI 数据，不会省略动作", field="actions")
@@ -561,10 +675,28 @@ class SceneBuilder:
             except (ValueError, KeyError, TypeError, AttributeError) as exc:
                 self.issue("error", "invalid_action", str(exc), field="actions")
         self.location = dict(local)
+        covered_setup = bool(self.native_export_target and kind == "wait"
+            and any(a["type"] == "cgexit" for a in valid)
+            and any(a["type"] not in {"cgexit", "bgm", "se"} for a in valid))
+        if covered_setup:
+            from .gui_cg_stage_handoff import ordered_exit_setup
+            try:
+                valid = ordered_exit_setup(valid)
+            except ValueError as exc:
+                self.issue("error", "cg_exit_stage_setup_rejected", str(exc), field="actions")
+                return
+        # A paired current-buffer launch also owns absolute XY + S2/Z.
+        # It must not smuggle an enter/exit, instant swap or camera into the
+        # compound transform. The legacy Hoshi route stays unchanged.
+        ordinary_geometry = bool(kind in {'line', 'wait'} and valid
+            and all(a['type'] in {'move', 'scale', 'depth', 'tilt'}
+                    and a['target'] in self.present for a in valid))
+        parallel_geometry = bool(self.native_export_target and
+            (ordinary_geometry or any(a['type']=='swap' and a['dur']>0 for a in valid)))
         for target in self.actors:
-            if (target, "xy") in channels and (target, "s2") in channels:
+            if not (parallel_geometry or covered_setup) and (target, "xy") in channels and (target, "s2") in channels:
                 self.issue("error", "unsupported_parallel_geometry", "同拍尺寸变换加绝对平移尚未完成原生原点对应，不按动作数组顺序猜测", actor_key=target, field="actions")
-            if (target, "xy") in channels and (target, "z") in channels:
+            if not (parallel_geometry or covered_setup) and (target, "xy") in channels and (target, "z") in channels:
                 self.issue("error", "unsupported_parallel_geometry", "移动和景深请先分成两个节拍；同时改变投影平面的轨道尚未接通。", actor_key=target, field="actions")
         if kind == "transition" and any(a.get("type") not in ("bgm", "se") for a in actions):
             self.issue("error", "unsupported_parallel_transition", "整幕转场与同拍动作尚未完成原生时序对应，不能把并行改成串行", field="actions")
@@ -583,7 +715,13 @@ class SceneBuilder:
                 self.issue("error", "audio_contract_rejected", str(exc), field="actions")
             handled.add(action["id"])
         if cg_actions:
-            handled |= self.cg_beat([a for a in valid if a["type"] not in ("bgm", "se")], cg_actions, kind, local)
+            handled |= self.cg_beat(cg_actions if covered_setup else
+                [a for a in valid if a["type"] not in ("bgm", "se")], cg_actions, kind, local)
+            if covered_setup:
+                if self.cg_state is not None or not self.covered:
+                    return
+                self.issue("info", "cg_exit_stage_setup_covered",
+                    "CG 退场完成后在黑／白场内设置舞台；没有自动淡入，请用后续淡入恢复显示。", field="actions")
         for action in valid:
             if action["type"] != "bg" or action["id"] in handled:
                 continue
@@ -595,6 +733,7 @@ class SceneBuilder:
             handled.add(action["id"])
         self.location = dict(local)
         deferred_hide = []
+        swap_slide_entries = {}
         enters = [a for a in valid if a["type"] == "enter"]
         for action in enters:
             self.location = {**local, "action_id": action["id"]}
@@ -609,31 +748,90 @@ class SceneBuilder:
                 if action["p"]["preset"] == "fade":
                     numeric(action["dur"], 100, 6000, "淡入时长", integral=True)
                 self.load_actor(action["target"], 255 if action["p"]["preset"] == "cut" else 0)
+                if action["p"]["preset"] in ("slideL", "slideR") and any(
+                        a["type"] == "swap" and a["target"] == action["target"] for a in valid):
+                    params = self.parameters[action["target"]]
+                    swap_slide_entries[action["target"]] = params["stage_x"]
+                    off = -params["height"] * .3 if action["p"]["preset"] == "slideL" else 1280 + params["height"] * .3
+                    numeric(off, -640, 1920, "滑入起点")
+                    off = rounded(off)
+                    # The preload is invisible. Place both buffers at the
+                    # entry edge before the shared swap/move launch.
+                    self.events[-1]["stage_x"] = params["stage_x"] = off
             except (ValueError, KeyError, TypeError, GuiRuntimeError) as exc:
                 self.issue("error", "invalid_enter", str(exc), field="actions")
-        # New body registration precedes other channels; positive swap dur
-        # keeps the old body in its native back buffer until both fades end.
-        # The source-size resolver remains unmodified.
+        # Same-beat expression and opacity are the new body's destinations,
+        # not second animations from inherited values. Register all fused
+        # actions once, independent of array order; later beats stay separate.
         for action in [a for a in valid if a["type"] == "swap"]:
             self.location = {**local, "action_id": action["id"]}
+            expression_action = next((a for a in valid if a["type"] == "expr"
+                                      and a["target"] == action["target"]), None)
+            alpha_action = next((a for a in valid if a["type"] == "fade"
+                                 and a["target"] == action["target"]), None)
+            lifecycle = next((a for a in valid if a["type"] in ("enter", "exit")
+                              and a["target"] == action["target"]), None)
+            if lifecycle and lifecycle["p"].get("preset") in ("fade", "slideL", "slideR"):
+                # Enter preloads a hidden body above; exit retires only after
+                # this beat's wait/text. They share the swap's ONE alpha pair.
+                alpha_action = {**lifecycle, "type": "fade",
+                    "p": dict(alpha=255 if lifecycle["type"] == "enter" else 0)}
             try:
-                if action["dur"] > 0 and any(a["target"] == action["target"]
-                        and a["type"] in ("enter", "exit", "fade") for a in valid):
-                    raise ValueError("换装渐变和同一角色的入场、退场或透明度变化请分成两个节拍；不能静默省掉其中一个。")
-                self.swap_actor(action)
+                if lifecycle:
+                    self.check_fields(lifecycle["p"], ("preset",), "入退场参数")
+                duration = max(action["dur"], expression_action["dur"] if expression_action else 0,
+                               alpha_action["dur"] if alpha_action else 0)
+                if duration > 0 and lifecycle and lifecycle["p"].get("preset") not in ("fade", "slideL", "slideR"):
+                    raise ValueError("换装同拍已接淡入/淡出和滑入/滑出；直接进退场请先分拍。")
+                self.swap_actor(action, expression_action, alpha_action)
+                if lifecycle and alpha_action and lifecycle["type"] == "exit":
+                    deferred_hide.append(action["target"])
+                for fused in (expression_action,alpha_action):
+                    if fused:
+                        self.mapping.append(dict(scene_id=self.scene["id"], **local,
+                            action_id=fused["id"], event_indexes=[len(self.events)-1]))
+                if lifecycle and lifecycle["p"].get("preset") in ("slideL", "slideR"):
+                    params = self.parameters[action["target"]]
+                    off = -params["height"] * .3 if lifecycle["p"]["preset"] == "slideL" else 1280 + params["height"] * .3
+                    x = swap_slide_entries[action["target"]] if lifecycle["type"] == "enter" else off
+                    self.location = {**local, "action_id": lifecycle["id"]}
+                    # Opacity is already fused. A pure XY destination lets the
+                    # native two-buffer path move both images without starting
+                    # a second alpha animation after the swap.
+                    self.add("GuiActorMove", dict(actor=params["actor"], x=x, y=params["bottom_y"],
+                        duration_ms=lifecycle["dur"], curve=lifecycle["curve"]))
+                    params["stage_x"] = x
             except (ValueError, KeyError, TypeError, GuiRuntimeError) as exc:
                 self.issue("error", "invalid_swap", str(exc), field="actions")
             handled.add(action["id"])
+            for fused in (expression_action,alpha_action):
+                if fused:
+                    # A rejected fusion must not fall back to animating the
+                    # old body. The failed scene emits no program.
+                    handled.add(fused["id"])
         # Load every portrait/body first, then load/arm blur, then launch the
         # remaining motions. A first-use blur load must not join a fade that
         # was just started earlier in this same beat.
         for action in [a for a in valid if a["type"] == "bgblur"]:
             self.location = {**local, "action_id": action["id"]}
             try:
-                self.background_blur_action(action, valid)
+                self.background_blur_action(action, valid, covered_setup=covered_setup)
             except (ValueError, KeyError, TypeError, GuiRuntimeError) as exc:
                 self.issue("error", "background_blur_rejected", str(exc), field="actions")
             handled.add(action["id"])
+        covered_poses = {}
+
+        def add_covered_pose(fields):
+            actor = fields["actor"]
+            if actor not in covered_poses:
+                self.add(POSE_KIND, fields)
+                covered_poses[actor] = len(self.events) - 1
+            else:
+                index = covered_poses[actor]
+                merged = pose_values({**{k: v for k, v in self.events[index].items() if k != "kind"}, **fields})
+                self.events[index] = dict(kind=POSE_KIND, **merged)
+                self.mapping.append(dict(scene_id=self.scene["id"], **self.location, event_indexes=[index]))
+
         for action in valid:
             self.location = {**local, "action_id": action["id"]}
             try:
@@ -648,7 +846,7 @@ class SceneBuilder:
                     self.check_fields(p, ("cx", "cy", "zoom"), "镜头参数")
                     self.add("CameraShot", dict(center_x=rounded(numeric(p.get("cx"), 0, 1280, "取景 X")),
                         center_y=rounded(numeric(p.get("cy"), 0, 720, "取景 Y")),
-                        zoom=rounded(numeric(p.get("zoom"), 80, 150, "镜头倍率")), duration_ms=dur, curve=action["curve"]))
+                        zoom=rounded(numeric(p.get("zoom"), ZOOM_MIN, ZOOM_SCHEMA_MAX, "镜头倍率")), duration_ms=dur, curve=action["curve"]))
                     self.camera_changed = (p["cx"], p["cy"], p["zoom"]) != (640, 360, 100)
                     self.camera_state = (p["cx"], p["cy"], p["zoom"])
                     continue
@@ -676,7 +874,7 @@ class SceneBuilder:
                     if p.get("preset") == "cut" and dur == 0:
                         # Hide joins everything. It cannot replace a parallel
                         # cut while another same-beat motion is running.
-                        if len([a for a in valid if a["type"] not in ("bgm", "se")]) != 1:
+                        if not covered_setup and len([a for a in valid if a["type"] not in ("bgm", "se")]) != 1:
                             raise ValueError("直接退场和其他同拍动作尚未接通；请使用淡出或独立等待节拍")
                         self.add("Hide", dict(actor=params["actor"]))
                         self.present.remove(target)
@@ -702,10 +900,38 @@ class SceneBuilder:
                     self.check_fields(p, ("z",), "景深参数")
                     fields.update(channels="z", depth=rounded(numeric(p.get("z"), 500, 2400, "景深")))
                     params.update(depth=fields["depth"], transformed=True)
+                elif typ == 'sway':
+                    p = sway_authored(action)
+                    if not self.native_export_target:
+                        raise ValueError('持续摇摆须使用目标绑定的原生导出，不支持旧固定 ABI 入口。')
+                    if p['axis'] == 'r' and self.native_rotation_converter is None:
+                        raise ValueError('此目标尚未绑定持续摇摆的原生角度换算。')
+                    amplitude = (self.native_rotation_converter(p['amp'])
+                                 if p['axis'] == 'r' else p['amp'])
+                    self.add(SWAY_START, dict(actor=fields['actor'],
+                        loop_id=self.scene['id'] + '_' + action['id'],
+                        axis=p['axis'], amplitude=amplitude,
+                        direction=1 if p['dir'] in {'right', 'down'} else -1,
+                        period_ms=p['periodMs'], curve=action['curve']))
+                    if p['axis'] == 'r':
+                        self.rotation_conversions.append(dict(**self.location, actor=fields['actor'],
+                            degrees=p['amp'], native_R=amplitude, role='sway_amplitude'))
+                    continue
                 elif typ == "tilt":
                     self.check_fields(p, ("r",), "倾斜参数")
-                    # Fixed target EXE: angle = R / 3600 * pi (20 units/degree).
-                    fields.update(channels="r", rotation=rounded(numeric(p.get("r"), -50, 50, "倾斜角度") * 20))
+                    degrees = numeric(p.get("r"), -50, 50, "倾斜角度")
+                    if self.native_export_target:
+                        if self.native_rotation_converter is None:
+                            raise ValueError("此目标的角度换算尚未接通；不能把其他游戏的旋转单位当成角度。")
+                        rotation = self.native_rotation_converter(degrees)
+                        if type(rotation) is not int or not -1000 <= rotation <= 1000:
+                            raise ValueError("目标原生旋转换算超出可输出范围。")
+                        self.rotation_conversions.append(dict(**self.location,
+                            actor=fields["actor"],degrees=degrees,native_R=rotation))
+                    else:
+                        # Fixed target EXE: R / 3600 * pi (20 units/degree).
+                        rotation = rounded(degrees * 20)
+                    fields.update(channels="r", rotation=rotation)
                 elif typ == "move":
                     self.check_fields(p, ("x", "y"), "平移参数")
                     x, y = numeric(p.get("x"), -640, 1920, "目标 X"), p.get("y")
@@ -713,7 +939,10 @@ class SceneBuilder:
                         y = params["bottom_y"]
                     y = numeric(y, -720, 1800, "目标 Y")
                     if params.get("transformed") or self.native_export_target:
-                        self.add("GuiActorMove", dict(**fields, x=x, y=y))
+                        if covered_setup:
+                            add_covered_pose(dict(actor=fields["actor"], x=x, y=y))
+                        else:
+                            self.add("GuiActorMove", dict(**fields, x=x, y=y))
                         params.update(stage_x=rounded(x), bottom_y=rounded(y))
                         continue
                     meta = self.resources.portraits[(params["archive"], params["body"])][1]
@@ -725,7 +954,11 @@ class SceneBuilder:
                     params.update(stage_x=rounded(x), bottom_y=rounded(y))
                 else:
                     raise ValueError("对象/动作类型未支持")
-                self.add("Action", fields)
+                if covered_setup and typ in POSE_ACTIONS:
+                    add_covered_pose({k: v for k, v in fields.items()
+                        if k not in {"channels", "duration_ms", "curve"}})
+                else:
+                    self.add("Action", fields)
                 if typ in ("enter", "fade"):
                     params["alpha"] = fields["alpha"]
                 elif typ == "expr":
@@ -756,27 +989,66 @@ class SceneBuilder:
             self.add("Hide", dict(actor=self.parameters[target]["actor"]))
             self.present.remove(target)
 
-    def swap_actor(self, action):
+    def swap_actor(self, action, expression_action=None, alpha_action=None):
         target, p = action["target"], action["p"]
+        swap_location = dict(self.location)
         if target not in self.present or self.cg_state is not None:
             raise ValueError("请先让角色入场，再换身体。")
-        self.check_fields(p, ("body", "policy"), "换身体参数")
-        numeric(action["dur"], 0, 6000, "换装时长", integral=True)
+        self.check_fields(p, ("body", "policy", "expr"), "换身体参数")
+        duration = numeric(action["dur"], 0, 6000, "换装时长", integral=True)
         if p.get("policy") not in ("keep", "source"):
-            raise ValueError("换身体需要选择保留大小或采用新来源大小。")
+            raise ValueError("换身体需要选择保留缩放倍率或采用新来源大小。")
         body_id = ident(p.get("body"), "目标身体")
         previous = deepcopy(self.parameters[target])
+        # Resolve the destination's own face table. The previous body's frame
+        # number may not even exist in it. Frame 0 is a first-frame fallback,
+        # not a claim that every game's frame 0 is a neutral expression.
         portrait = self.actor_parameters(target, body_id=body_id,
-            expression=previous["expression"], source_size=True)
+            expression=0, source_size=True)
+        face = self.resources.portraits[(portrait["archive"], portrait["body"])][2]
+        expression = numeric(p.get("expr", 0), 0, face["frame_count"]-1,
+                             "新身体起始表情帧", integral=True)
+        if expression_action:
+            self.location = {**swap_location, "action_id": expression_action["id"]}
+            self.check_fields(expression_action["p"], ("expr",), "表情参数")
+            destination = numeric(expression_action["p"].get("expr"), 0,
+                                  face["frame_count"]-1, "新身体表情帧", integral=True)
+            # Preserve expression validation even though no separate Action
+            # event is emitted (e.g. 99ms remains invalid, not silently fused).
+            values("Action", dict(actor=portrait["actor"], channels="parts",
+                expression=destination, duration_ms=expression_action["dur"],
+                curve=expression_action["curve"]))
+            self.location = swap_location
+            if "expr" in p and expression != destination:
+                raise ValueError("换装指定的表情与同拍表情不同；请选择同一个表情，或放到下一节拍。")
+            expression = destination
+            duration = max(duration, expression_action["dur"])
+        portrait["expression"] = expression
         fields = dict(portrait=portrait, policy=p["policy"])
-        if action["dur"] > 0:
-            fields["duration_ms"] = action["dur"]
+        target_alpha = previous['alpha']
+        if alpha_action:
+            self.location = {**swap_location, 'action_id':alpha_action['id']}
+            self.check_fields(alpha_action['p'], ('alpha',), '透明度参数')
+            target_alpha = rounded(numeric(alpha_action['p'].get('alpha'),0,255,'透明度'))
+            # Preserve the ordinary alpha validation; a malformed duration
+            # must not be hidden by the longer swap/expression duration.
+            values('Action',dict(actor=portrait['actor'],channels='alpha',alpha=target_alpha,
+                duration_ms=alpha_action['dur'],curve=alpha_action['curve']))
+            duration = max(duration,alpha_action['dur'])
+            fields['target_alpha'] = target_alpha
+            self.location = swap_location
+        if duration > 0:
+            fields["duration_ms"] = duration
         self.add("GuiActorSwap", fields)
         # Both modes keep the author's standing position. No face/head matching.
         portrait.update(stage_x=previous["stage_x"], bottom_y=previous["bottom_y"],
-                        depth=previous["depth"], alpha=previous["alpha"], transformed=True)
+                        depth=previous["depth"], alpha=target_alpha, transformed=True)
         if p["policy"] == "keep":
-            portrait["height"] = previous["height"]
+            old_meta = self.resources.portrait(previous)[1]
+            new_meta = self.resources.portrait(portrait)[1]
+            # Retain the pixel scale for future swaps/re-entry; a taller pose
+            # canvas must not be squeezed back into the previous bitmap height.
+            portrait["height"] = rounded(previous["height"] * new_meta["height"] / old_meta["height"])
         self.actor_bindings[target] = dict(body=body_id, height=portrait["height"])
 
     def audio_action(self, action):
@@ -784,14 +1056,16 @@ class SceneBuilder:
         typ, p = action["type"], action["p"]
         if action["target"] != "audio":
             raise ValueError("声音动作的对象不正确。")
-        self.check_fields(p, ("op", "asset", "volume", "loop"), "声音参数")
+        self.check_fields(p, ("op", "asset", "volume", "loop", "fadeInMs"), "声音参数")
         fields = dict(op=p.get("op"), source=None, archive=None, resource=None, sha256=None,
                       volume=p.get("volume"), loop=p.get("loop"), duration_ms=action["dur"])
-        if fields["op"] == "play":
+        if "fadeInMs" in p:
+            fields["fade_in_ms"] = p["fadeInMs"]
+        if fields["op"] in ("play", "restart"):
             fields.update(self.audio_reference(p.get("asset"), typ))
             audio_values("GuiBGM" if typ == "bgm" else "GuiSE", fields)
         elif p.get("asset") is not None:
-            raise ValueError("停止声音时不应指定素材。")
+            raise ValueError("保持、调音量或停止声音时不应指定素材。")
         self.add("GuiBGM" if typ == "bgm" else "GuiSE", fields)
 
     def audio_reference(self, asset_id, typ):
@@ -927,7 +1201,7 @@ class SceneBuilder:
         choice_id = "C" + checksum([self.scene["id"], beat["id"]])[:24]
         fields = dict(choice_id=choice_id, prompt=beat.get("prompt"),
             **{f"option_{index}": label for index, label in enumerate(labels, 1)})
-        choice_options(values("Choice", fields))
+        choice_options(values("Choice", fields), encoding=None if self.native_export_target else "gbk")
         self.add("Choice", fields)
         for index, option in enumerate(options, 1):
             self.location = {**local, "option_index": index, "field": f"options[{index-1}]"}
@@ -1018,8 +1292,16 @@ class SceneBuilder:
             if "effects" in option:
                 self.story_effects(option["effects"])
             for number, branch_beat in enumerate(option["beats"], 1):
-                self.translate_beat(branch_beat, action_ids, {**branch_location,
-                    "branch_beat_index": number, "field": f"options[{index-1}].beats[{number-1}]"})
+                context = (self.next_beat_id, self.last_root_beat)
+                if self.native_export_target:
+                    following = option["beats"][number] if number < len(option["beats"]) else None
+                    self.next_beat_id = following.get("id") if isinstance(following, dict) else None
+                    self.last_root_beat = False
+                try:
+                    self.translate_beat(branch_beat, action_ids, {**branch_location,
+                        "branch_beat_index": number, "field": f"options[{index-1}].beats[{number-1}]"})
+                finally:
+                    self.next_beat_id, self.last_root_beat = context
             state = self.track_state()
             self.location = dict(branch_location)
             if completion == "merge" and joined is not None and self.merge_state(state) != self.merge_state(joined):
@@ -1067,8 +1349,10 @@ class SceneBuilder:
                 or hashlib.sha256(payload).hexdigest() != identity["payload_sha256"]
                 or fingerprint(path) != stamp):
             raise GuiRuntimeError("source_changed", "读取 CG 证据时来源发生变化", 409)
-        cg_scale(metadata["width"], metadata["height"])
-        fields = dict(source_game=source.name, archive=str(path), resource=definition["resource"], fit="contain")
+        if not self.native_export_target:
+            cg_scale(metadata["width"], metadata["height"])
+        fields = dict(source_game=source.id if self.native_export_target else source.name,
+                      archive=str(path), resource=definition["resource"], fit="contain")
         self.resources.cgs[(str(path), definition["resource"])] = dict(
             name="CG_PREFLIGHT_" + definition["sha256"].upper(), metadata=deepcopy(metadata))
         self.resources.references.append((path, stamp))
@@ -1076,12 +1360,25 @@ class SceneBuilder:
         return fields
 
     def cg_beat(self, valid, cg_actions, kind, local):
-        """CG loads/geometry are independent beats; never serialize a compound.
+        """Bind supported CG compounds explicitly; never serialize by array order.
 
-        Exception: wait-only exit+zero-time BG, loaded while still covered. GUI
-        array order does not choose which event owns cleanup or the final BG.
+        Generic load+geometry shares one native reveal frontier. Wait-only
+        exit+zero-time BG loads while covered, with explicit cleanup ownership.
         """
         handled = {a["id"] for a in cg_actions}
+        if (self.native_export_target and kind in {'line','wait'} and len(valid)==2
+                and len(cg_actions)==2 and {a['type'] for a in cg_actions}=={'cg','cgxf'}):
+            # A single target-native display transaction loads the picture,
+            # then starts its own XY/Z at reveal, before the dissolve wait.
+            before = len(self.events)
+            for typ in ('cg','cgxf'):
+                action = next(a for a in cg_actions if a['type']==typ)
+                self.cg_beat([action],[action],kind,local)
+            if (len(self.events)==before+2 and
+                    [e['kind'] for e in self.events[before:]]==['GuiCGLoad','GuiCGTransform']):
+                self.native_parallel_cg.append(dict(beat_id=local['beat_id'], action_indexes=[before,before+1]))
+            self.location = dict(local)
+            return handled
         background_actions = [a for a in valid if a["type"] == "bg"]
         exits = [a for a in cg_actions if a["type"] == "cgexit"]
         exit_background = len(exits) == 1 and len(cg_actions) == 1 and len(background_actions) == 1 and len(valid) == 2
@@ -1099,43 +1396,51 @@ class SceneBuilder:
             typ, p, dur = action["type"], action["p"], action["dur"]
             if typ == "cg" and action["target"] == "stage":
                 self.check_fields(p, ("cg",), "CG 入场参数")
-                if self.present:
+                if self.present and not self.native_export_target:
                     raise ValueError("CG 入场前须先退场并清除普通立绘")
                 if self.covered:
                     raise ValueError("CG 入场时整幕仍被黑/白遮盖；请先明确 reveal，不会自动揭开遮盖")
-                if self.cg_state is None and self.camera_changed:
+                if self.cg_state is None and self.camera_changed and not self.native_export_target:
                     raise ValueError("首次 CG 入场前须恢复基准镜头；重定基尚未接通")
                 fields = self.cg_binding(p.get("cg"))
                 state = self.cg_state or dict(x=0,y=0,s=100)
                 binding = self.resources.cgs[(fields["archive"], fields["resource"])]
-                cg_scale(binding["metadata"]["width"], binding["metadata"]["height"], state["s"])
+                if not self.native_export_target:
+                    cg_scale(binding["metadata"]["width"], binding["metadata"]["height"], state["s"])
                 self.add("GuiCGLoad", {**fields, "duration_ms": dur})
                 self.cg_state = {**state, "asset": p["cg"]}
-                self.background_state = None
-                self.background_asset_id, self.background_blur_state = None, None
+                if not self.native_export_target:
+                    self.background_state = None
+                    self.background_asset_id, self.background_blur_state = None, None
             elif typ == "cgxf" and action["target"] == "cgview":
                 self.check_fields(p, ("x","y","s"), "CG 构图参数")
                 if self.cg_state is None:
                     raise ValueError("没有正在显示的 CG，不能调整局部构图")
                 fields = cg_event_values("GuiCGTransform", {**p,"duration_ms":dur,"curve":action["curve"]})
                 state = self.cg_state
-                if p["s"] != state["s"] and any(v != 0 for v in (state["x"],state["y"],p["x"],p["y"])):
+                if (not self.native_export_target and p["s"] != state["s"]
+                        and any(v != 0 for v in (state["x"],state["y"],p["x"],p["y"]))):
+                    # Only the generic native CG compiler resolves XY at each
+                    # endpoint's own Z. The Hoshi-only emitter is unchanged.
                     raise ValueError("非零位移上的 CG 缩放尚需原点补偿；请独立回到原点再缩放，不会自动修改工作流")
                 binding_fields = self.cg_bindings[state["asset"]]
                 metadata = self.resources.cgs[(binding_fields["archive"], binding_fields["resource"])]["metadata"]
-                cg_scale(metadata["width"], metadata["height"], p["s"])
+                if not self.native_export_target:
+                    cg_scale(metadata["width"], metadata["height"], p["s"])
                 self.add("GuiCGTransform", fields)
                 self.cg_state = {**state, **p}
             elif typ == "cgexit" and action["target"] == "stage":
                 self.check_fields(p, ("color",), "CG 退场参数")
                 if kind != "wait" or self.cg_state is None:
                     raise ValueError("CG 退场本轮须为独立等待节拍，并且已有 CG；台词同拍尚未接通")
-                if self.camera_changed:
+                if self.camera_changed and not self.native_export_target:
                     raise ValueError("CG 退场前须明确恢复基准镜头，不能把原生清理的镜头复位隐藏在退场里")
                 self.add("GuiCGExit", dict(colour=p.get("color"), duration_ms=dur))
-                self.cg_state, self.camera_changed = None, False
-                self.camera_state, self.background_state = (640, 360, 100), None
-                self.background_asset_id, self.background_blur_state = None, None
+                self.cg_state = None
+                if not self.native_export_target:
+                    self.camera_changed = False
+                    self.camera_state, self.background_state = (640, 360, 100), None
+                    self.background_asset_id, self.background_blur_state = None, None
                 self.covered = True
                 if exit_background:
                     bg = background_actions[0]
@@ -1147,7 +1452,8 @@ class SceneBuilder:
                     self.issue("info", "cg_exit_background_covered", "CG 退场完成后在黑/白场遮盖内加载背景；最终状态不依赖动作数组顺序，需后续 reveal 恢复显示", field="actions")
             else:
                 raise ValueError("CG 对象与动作类型不匹配")
-            self.issue("info", "cg_static_scope", "CG 仅做已审核目标 ABI 的内存预检；二维舞台不等于 V3D 中途轨道/实机显示验收", field="actions")
+            if not self.native_export_target:
+                self.issue("info", "cg_static_scope", "CG 仅做已审核目标 ABI 的内存预检；二维舞台不等于 V3D 中途轨道/实机显示验收", field="actions")
         except (ValueError, KeyError, TypeError, GuiRuntimeError) as exc:
             self.issue("error", "cg_contract_rejected", str(exc), field="actions")
         self.location = dict(local)
@@ -1173,32 +1479,25 @@ def native_emit(program, resources):
     emitter = (GuiAudioEmitter(source, clean) if any(e["kind"] in AUDIO_KINDS for e in program["events"])
                else GuiCgEmitter(source, clean))
     payload = emitter.compile(program, resources)
-    prefix = bytearray(payload[:len(source)])
-    prefix[ENTRY:ENTRY+5] = ENTRY_BYTES
-    emitter.native_speakers.validate_patches(payload, prefix)
-    if prefix != source:
-        raise ValueError("内存编译修改了登记入口之外的原始 HCB")
-    appended = payload[len(source):]
-    table_at = struct.unpack_from("<I", clean)[0]
-    synthetic = struct.pack("<I", 4+len(appended)) + appended + clean[table_at:]
-    decoded = parse_bytes(synthetic, encoding="gbk")
-    if decoded.warnings:
-        raise ValueError("新增原生字节码解码失败")
-    boundaries = {len(source)+ins.offset-4 for ins in decoded.instructions} | set(emitter.by_offset)
-    if any(ins.opcode in (2, 6, 7) and ins.operands["target"] not in boundaries for ins in decoded.instructions):
-        raise ValueError("新增原生调用/跳转未落在指令边界")
+    from .gui_scene_export import validate_bytes
+    instruction_count = validate_bytes(source, clean, payload, emitter)
     resources.check_unchanged()
     if any(fingerprint(path) != stamp for path, stamp in zip(paths, stamps)):
         raise GuiRuntimeError("target_changed", "预检期间目标母本发生变化", 409)
-    proof = dict(checked=True, instruction_count=len(decoded.instructions),
-        appended_bytes=len(appended), payload_sha256=hashlib.sha256(payload).hexdigest(),
-        original_prefix_unchanged_outside_entry=not emitter.native_speakers.patches, instruction_boundaries_checked=True,
+    proof = dict(checked=True, instruction_count=instruction_count,
+        appended_bytes=len(payload)-len(source), payload_sha256=hashlib.sha256(payload).hexdigest(),
+        original_prefix_unchanged_outside_entry=getattr(emitter, 'story_bank', None) is None and not emitter.native_speakers.patches,
+        original_code_unchanged_outside_entry=not emitter.native_speakers.patches, instruction_boundaries_checked=True,
         resource_pack_built=False, runtime_verified=False, virtual_resource_bindings=True,
         plan_sha256=digest(program), source_hcb_sha256=SOURCE_SHA,
         clean_hcb_sha256=CLEAN_SHA, target_exe_sha256=EXE_SHA)
     proof["native_motion_contract"] = emitter.stage_motion.report()
     proof["native_stage_helpers"] = emitter.stage_helpers.report()
     proof["speaker_identity_contract"] = emitter.native_speakers.report()
+    if getattr(emitter, 'story_bank', None) is not None:
+        proof['story_state'] = emitter.story_bank.report()
+    if getattr(emitter, 'legacy_audio_program', None) is not None:
+        proof['audio_program'] = emitter.legacy_audio_program.report()
     if any(e["kind"] == "GuiActorSwap" and e.get("duration_ms", 0) > 0
            for e in program["events"]):
         proof["actor_swap_blend_contract"] = emitter.actor_swap_blend.report()
