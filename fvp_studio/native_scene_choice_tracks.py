@@ -19,7 +19,7 @@ from .portrait_emitter import _encode_push
 
 KINDS = GUI_KINDS | CHOICE_KINDS
 BRANCH_KINDS = {"Text", "Speech", "Wait", "Action", "GuiActorMove", "GuiActorSlide", "CameraShot",
-                "Portrait", "Hide", "GuiActorSwap", "GuiActorPoseSet", "GuiActorSwayStart", "GuiActorSwayStop", "Background", "GuiBackgroundChange", "GuiBackgroundBlur", "Transition"}
+                "Portrait", "Hide", "GuiActorSwap", "GuiActorPoseSet", "GuiActorSwayStart", "GuiActorSwayStop", "GuiActorNod", "Background", "GuiBackgroundChange", "GuiBackgroundBlur", "Transition"}
 
 
 def bind_scene_menu(context):

@@ -37,7 +37,7 @@ SCHEMA = "fvp-native-scene-cg/1"
 BRANCH_KINDS = {"GuiCGLoad", "GuiCGExit", "GuiCGTransform"}
 STAGE_EVENTS = {"Background", "GuiBackgroundChange", "GuiBackgroundBlur",
     "Portrait", "Hide", "GuiActorSwap", "Action", "GuiActorMove",
-    "GuiActorSlide", "GuiActorPoseSet", "GuiActorSwayStart", "GuiActorSwayStop", "CameraShot"}
+    "GuiActorSlide", "GuiActorPoseSet", "GuiActorSwayStart", "GuiActorSwayStop", "GuiActorNod", "CameraShot"}
 
 
 class NativeSceneCG:
@@ -226,9 +226,14 @@ class NativeSceneCG:
     def emit_load_with_transform(self, event, transform):
         event_values('GuiCGLoad', {k:v for k,v in event.items() if k!='kind'})
         event_values('GuiCGTransform', {k:v for k,v in transform.items() if k!='kind'})
-        if self.screen and self.screen.covered is not None:
+        transition = event.get('transition')
+        if transform.get('transition') is not None:
+            raise ValueError('同拍加载与构图只允许一份统一转场。')
+        if not transition and self.screen and self.screen.covered is not None:
             raise ValueError('黑白场下请先淡入恢复，再启动 CG。')
         self.join()
+        if transition:
+            self._transition_before(transition)
         motion = self.bind_motion()
         identity = self._bind_resource(event)
         retained = self.active['retained'] if self.active else self._retained_state()
@@ -242,17 +247,67 @@ class NativeSceneCG:
             transform['duration_ms'],transform['curve'])
         launch = bytes(self.output[before:])
         del self.output[before:]
-        library = self._library(active,event['duration_ms'],display_launch=launch)
+        library = self._library(active,0 if transition else event['duration_ms'],display_launch=launch)
         self.output.extend(_call(library.report['entries']['display']))
+        if transition:
+            self._transition_after(transition)
         active['view'] = end
         self.active = active
         self.operations.append(dict(kind='GuiCGLoadWithTransform',identity=identity,
             duration_ms=event['duration_ms'],motion_duration_ms=transform['duration_ms'],
             view=deepcopy(end),native_motion_before_reveal_wait=True))
 
+    def _transition_before(self, transition):
+        from .gui_cg_transition import values
+        transition = values(transition)
+        if self.screen is None:
+            raise ValueError('CG 组合转场需要目标自己的整幕转场绑定。')
+        method = transition['type']
+        if method in {'black_out', 'white_out'}:
+            transition = dict(transition, type=method.split('_')[0])
+        elif method == 'reveal':
+            transition = dict(transition, type='dissolve')
+        self.screen.chapter_before(transition)
+
+    def _transition_after(self, transition):
+        method = transition['type']
+        if method not in {'black_out', 'white_out'}:
+            self.screen.chapter_after(dict(transition, type='dissolve') if method == 'reveal' else transition)
+        self.operations.append(dict(kind='CGTransition', transition=deepcopy(transition),
+            implicit_cg_fade=False, single_transition_owner=True))
+
+    def emit_transition(self, event):
+        """Prepare the new frame, then let exactly one transition reveal it."""
+        transition, kind = event['transition'], event['kind']
+        if kind != 'GuiCGLoad' and self.active is None:
+            raise ValueError('CG 退场／构图需要已显示的 CG。')
+        self.join()
+        self._transition_before(transition)
+        if kind == 'GuiCGLoad':
+            identity = self._bind_resource(event)
+            retained = self.active['retained'] if self.active else self._retained_state()
+            view = deepcopy(self.active['view']) if self.active else dict(x=0, y=0, s=100)
+            active = dict(identity=identity, retained=deepcopy(retained), fit=event['fit'], view=view)
+            library = self._library(active, 0)
+            self.output.extend(_call(library.report['entries']['display']))
+            self.active = active
+            self.operations.append(dict(kind=kind, identity=identity, setup_without_reveal=True))
+        elif kind == 'GuiCGExit':
+            self._hide(reason='GuiCGExitTransition')
+        else:
+            # Motion starts before the transition wait, not after it.
+            self.emit({k: v for k, v in event.items() if k != 'transition'})
+        self._transition_after(transition)
+
     def emit(self, event):
         kind = event["kind"]
         event_values(kind, {k: v for k, v in event.items() if k != "kind"})
+        if 'transition' in event:
+            self.emit_transition(event)
+            return
+        if kind == "GuiCGSetup" and (self.active is not None or self.background is None
+                or (self.portraits is not None and self.portraits.states)):
+            raise ValueError("开场 CG 需要已布置的背景，且不能同时布置另一张 CG 或在场立绘。")
         if kind == "GuiCGTransform":
             if self.active is None:
                 raise ValueError("没有正在显示的 CG，不能改变构图。")
@@ -265,8 +320,8 @@ class NativeSceneCG:
             self.operations.append(dict(kind=kind, view=deepcopy(view), duration_ms=event["duration_ms"]))
             return
         self.join()
-        if kind == "GuiCGLoad":
-            if self.screen and self.screen.covered is not None:
+        if kind in {"GuiCGSetup", "GuiCGLoad"}:
+            if kind == "GuiCGLoad" and self.screen and self.screen.covered is not None:
                 raise ValueError("黑白场下的 CG 渐变尚需独立绑定，请先淡入恢复画面。")
             identity = self._bind_resource(event)
             retained = self.active["retained"] if self.active else self._retained_state()
@@ -277,6 +332,10 @@ class NativeSceneCG:
             self.active = active
             self.operations.append(dict(kind=kind, identity=identity, duration_ms=event["duration_ms"],
                 entry=library.report["entries"]["display"]))
+            if kind == "GuiCGSetup":
+                # Zero-time presentation loads the resource without revealing
+                # it. The chapter exit remains the sole transition owner.
+                self.operations[-1]["setup_without_reveal"] = True
         else:
             if self.active is None:
                 raise ValueError("没有已显示的 CG 可退场。")
@@ -288,6 +347,20 @@ class NativeSceneCG:
             self.screen.emit(dict(kind="Transition", method=event["colour"]+"_out",
                                   duration_ms=event["duration_ms"]))
             self._hide(reason=kind)
+
+    def begin_exit_line(self, event):
+        event_values('GuiCGExit', {k: v for k, v in event.items() if k != 'kind'})
+        if event.get('kind') != 'GuiCGExit' or self.active is None or self.screen is None:
+            raise ValueError('CG 退场配台词需要当前CG和本目标整幕转场。')
+        self.join()
+        start = self.screen.prepare_parallel(dict(kind='Transition',
+            method=event['colour']+'_out', duration_ms=event['duration_ms']))
+        self.output.extend(start)
+
+    def finish_exit_line(self):
+        # Do not free/reload a CG while Dissolve or this line still owns it.
+        self.screen.finish_parallel()
+        self._hide(reason='GuiCGExitWithLine')
 
     def _hide(self, *, reason):
         if self.active is None:
@@ -337,12 +410,13 @@ class NativeSceneCG:
         self.check_unchanged()
         return self.thread_handoff.prepare(len(self.context.document.original_bytes)+len(self.output))
 
-    def prepare_threaded_scene_image(self,payload,anchor,*,_defer_preserved_source_cycles=False):
+    def prepare_threaded_scene_image(self,payload,anchor,*,_defer_preserved_source_cycles=False,
+                                    voice_replay=None):
         self.check_unchanged()
         image,report = NativeCGSceneThreadImage(self.thread_handoff,self.thread_slots,
             snapshot_storage=self.snapshot_storage,original_graph_journal=self.original_graph_journal).assemble(
             payload,anchor,cleanup_sites=self.thread_cleanups,
-            _defer_preserved_source_cycles=_defer_preserved_source_cycles)
+            _defer_preserved_source_cycles=_defer_preserved_source_cycles, voice_replay=voice_replay)
         self.thread_image_report = deepcopy(report)
         self.check_unchanged()
         return image,report

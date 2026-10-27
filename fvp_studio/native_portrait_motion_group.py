@@ -1,9 +1,31 @@
 """Own one contiguous, beat-local current-buffer motion launch.
 
-Only absolute XY with S2/Z needs this resolver. No body, camera, alpha,
+Only absolute XY with S2/Z needs this resolver. Independent alpha/parts
+companions share its launch boundary, not its geometry. No body, camera,
 dialogue, choice boundary or second launch may be hidden in a motion group.
 """
 from .gui_runtime import ID_RE
+
+
+GEOMETRY_CHANNELS = {'s2', 'z', 'r'}
+COMPANION_CHANNELS = {'alpha', 'parts'}
+
+
+def split_motion_events(events):
+    """Separate validated independent channels without changing the input IR."""
+    geometry, companions = [], []
+    for event in events:
+        if event['kind'] == 'GuiActorMove':
+            geometry.append(event)
+            continue
+        channels = event['channels'].split('+')
+        motion = [c for c in channels if c in GEOMETRY_CHANNELS]
+        if motion:
+            geometry.append(dict(event, channels='+'.join(motion)))
+        for channel in channels:
+            if channel in COMPANION_CHANNELS:
+                companions.append(dict(event, channels=channel))
+    return geometry, companions
 
 
 def bind_motion_groups(events, groups, occupied=()):
@@ -15,7 +37,7 @@ def bind_motion_groups(events, groups, occupied=()):
             raise ValueError('普通同拍运动缺少明确的节拍身份。')
         beat, indexes = group['beat_id'], group['action_indexes']
         if (not isinstance(beat, str) or not ID_RE.fullmatch(beat) or beat in beats
-                or not isinstance(indexes, list) or not 2 <= len(indexes) <= 16
+                or not isinstance(indexes, list) or not 2 <= len(indexes) <= 24
                 or any(type(i) is not int or not 0 <= i < len(events) or i in used for i in indexes)
                 or indexes != list(range(indexes[0], indexes[-1] + 1))):
             raise ValueError('普通同拍运动不能重复、跨台词、跨分支或跨另一提交组。')
@@ -24,14 +46,14 @@ def bind_motion_groups(events, groups, occupied=()):
             event = events[index]
             if (event.get('kind') not in {'GuiActorMove', 'Action'}
                     or type(event.get('actor')) is not int or not 1 <= event['actor'] <= 4):
-                raise ValueError('普通同拍运动只接已在场角色的移动、缩放、景深和倾斜。')
+                raise ValueError('普通同拍运动只接已在场角色的移动、缩放、景深、倾斜、表情和透明度。')
             raw = event.get('channels', '')
             if event['kind'] == 'Action' and not isinstance(raw, str):
                 raise ValueError('普通同拍运动的通道需要明确的文字定义。')
             names = ['xy'] if event['kind'] == 'GuiActorMove' else raw.split('+')
-            allowed = {'xy'} if event['kind'] == 'GuiActorMove' else {'s2', 'z', 'r'}
+            allowed = {'xy'} if event['kind'] == 'GuiActorMove' else GEOMETRY_CHANNELS | COMPANION_CHANNELS
             if not names or set(names) - allowed or len(names) != len(set(names)):
-                raise ValueError('普通同拍运动不能包含透明度、表情或未知通道。')
+                raise ValueError('普通同拍运动不能包含出入场、换装或未知通道。')
             own = channels.setdefault(event['actor'], set())
             if own.intersection(names):
                 raise ValueError('普通同拍运动的同一角色同一通道不能重复。')

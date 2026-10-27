@@ -22,6 +22,8 @@ class NativeAudioBindings(GuiAudioBindings):
             raise ValueError('声音调用与素材目标不是同一份游戏脚本。')
         native.validate()
         self.native, self.bindings, self.groups, self.published = native, {}, {}, False
+        self.voice_replay_next = None
+        self.voice_replay_tokens = []
         grouped = {}
         for key, asset in sorted(frozen.audios.items()):
             kind = asset.get('kind')
@@ -72,11 +74,20 @@ class NativeAudioBindings(GuiAudioBindings):
                 raise GuiRuntimeError('source_changed','分配声音时目标资源包发生变化。',409)
         frozen.check_unchanged()
 
+    def reserve_voice_replay_token(self):
+        if 'voice' not in self.native.bindings or not any(b.get('kind') == 'voice' for b in self.bindings.values()):
+            raise ValueError('回看配音编号缺少已绑定的人声素材。')
+        # Token space is shared by native replay metadata, not scoped to the
+        # selected output archive. Reuse the same two-pack/new-entry allocator
+        # as the legacy exporter; keep playback paths target-bound above.
+        return super().reserve_voice_replay_token()
+
     def report(self):
         result = super().report()
         result.update(schema=SCHEMA,target=getattr(self.native.context,'target_id',None),
             game_name_switch_used=False,explicit_target_paths=True,
             original_ids_reused=False,pack_built=self.published,
+            voice_replay_tokens=list(self.voice_replay_tokens),
             scene_export_connected=False,runtime_verified=False)
         return result
 

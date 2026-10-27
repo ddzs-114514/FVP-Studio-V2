@@ -397,13 +397,14 @@ class NativeAudioBackend:
 
     def report(self):
         from .gui_audio_program import playback_contract
+        voice = self.voice.report() if self.voice else None
         return dict(schema=SCHEMA, target_id=getattr(self.context,'target_id',None),
-            playback=playback_contract(self.bindings),
+            playback=playback_contract(self.bindings, voice_backlog_replay=bool(voice and voice['backlog_replay'])),
             game_name_switch_used=False, source_sha256=self.source.source_sha256,
             kinds={kind: dict(native_calls_bound=True, function=row['span'].start,
                 native_slots=row['slots'], native_category=row['category'], routes=deepcopy(row['routes']),
                 native_slot_allocator=kind=='se', runtime_verified=False)
                 for kind,row in self.bindings.items()}, blockers=deepcopy(self.blockers),
-            voice_bound=self.voice is not None, voice=self.voice.report() if self.voice else None,
+            voice_bound=self.voice is not None, voice=voice,
             scene_export_connected=False, chapter_export_connected=False,
             original_audio_restore_connected=False, runtime_verified=False)

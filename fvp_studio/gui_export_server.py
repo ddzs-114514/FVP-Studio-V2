@@ -102,21 +102,65 @@ class ExportRuntime(PreflightRuntime):
         generic = result['scene_export_contract']['generic_targets']
         from .gui_actor_sway import contract as sway_contract
         generic['portrait_sway'] = sway_contract()
+        from .gui_actor_nod import contract as nod_contract
+        generic['portrait_nod'] = nod_contract()
+        from .gui_cg_transition import contract as cg_transition_contract
+        generic['cg']['transitions'] = cg_transition_contract()
         generic['body_swap_alpha_fusion'] = dict(supported=True,duration_policy='max',
             actions=['fade','enter_fade','exit_fade','enter_slide','exit_slide'],event_field='target_alpha',
             slide_fusion=True,target_support_required=True,runtime_verified=False)
         generic['body_swap_parallel_stage'] = dict(supported=True,camera=True,background_blur=True,
             other_actor_fade=True,same_actor_alpha=False,other_actor_slide=True,
+            other_actor_expression=True,slide_with_geometry=True,screen_transition=True,background_change=True,
             native_apply_frontier=True,target_support_required=True,runtime_verified=False)
+        from .native_parallel_beat import contract as parallel_contract
+        generic['same_beat'] = parallel_contract()
         generic['cg']['load_with_transform'] = True
+        from .gui_native_cg import opening_setup_contract
+        generic['cg']['opening_setup'] = opening_setup_contract()
+        result['scene_export_contract']['cg_opening_setup'] = opening_setup_contract()
         from .gui_cg_stage_handoff import contract as cg_exit_setup_contract
         generic['cg']['exit_stage_setup'] = cg_exit_setup_contract()
         generic['audio'] = dict(schema='fvp-native-audio-capability/1',kinds=['bgm','se','voice'],
             binding='target_native_wrapper_argument_flow',support_confirmed_on_export=True,
-            target_info_required=True,paired_native_state_required=True,voice=True,voice_backlog_replay=False,
-            local_choice_branches=True,original_playback_restore=False,runtime_verified=False)
+            target_info_required=True,paired_native_state_required=True,voice=True,voice_backlog_replay=True,
+            voice_backlog_binding='target_history_record_row_table_and_separate_replay_slot',
+            voice_current_line_replay=True,
+            voice_current_line_binding='target_current_voice_and_speaker_fields_with_native_dialogue_slot',
+            local_choice_branches=True,original_playback_restore=True,
+            original_playback_restore_binding='target_retained_sound_slot_decoder_and_secondary_buffer',
+            original_playback_restore_target_info_required=True,
+            original_playback_restore_runtime_verified=False,runtime_verified=False)
         from .gui_audio_program import playback_contract
-        generic['audio']['playback'] = playback_contract(['bgm','se','voice'])
+        generic['audio']['playback'] = playback_contract(['bgm','se','voice'], voice_backlog_replay=True,
+            voice_current_line_replay=True)
+        # One capability for every exporter; this is not a title-specific UI
+        # option. Actual EXE matching and the paired build still gate support.
+        resume_contract=dict(schema='fvp-native-audio-resume-capability/1',
+            shared_native_implementation=True,binding='target_retained_sound_slot_decoder_and_secondary_buffer',
+            support_confirmed_on_export=True,requires_matching_new_test_executable=True,
+            kinds=['bgm','se','voice'],capture='once_per_authored_program',
+            restore='after_final_authored_exit_before_original_story',
+            runtime_verified=False,save_load_verified=False)
+        result['scene_export_contract']['original_audio_resume']=resume_contract
+        from .gui_audio_checkpoint import contract as checkpoint_contract
+        resume_contract['checkpoint_test_export'] = checkpoint_contract()
+        generic['audio']['original_audio_resume']=dict(resume_contract)
+        # Separate from the read-only movie catalog's native_export=False;
+        # older GUI readers strictly validate that catalog contract.
+        result['scene_export_contract']['movie'] = dict(schema='fvp-native-movie-capability/1',
+            endpoint='scene-export', beat_kind='movie', target_info_required=True,
+            support_confirmed_on_export=True, standalone_op_scene_only=True,
+            chapter_mainline=True, chapter_endpoint='native-chapter-export',
+            chapter_single_movie_beat=False, sequential_movie_beats=True,
+            sequence_transition='first_entry_last_exit', between_movies='cut', skippable_per_movie=True,
+            movie_exit_choices=False, movie_exit_conditions=False,
+            transition_handoff='native_ready_and_before_stop',
+            mixed_beats=False, same_target_files_only=False, registered_source_import=True,
+            requires_target_native_extension=True, decoder_compatibility_verified=False,
+            external_transcoding=False, waits_for_native_end=True,
+            duration_is_preview_estimate=True, skippable=True,
+            requires_matching_new_test_executable=True, runtime_verified=False)
         result["scene_export_contract"]["generic_targets"]["linear_chapter"] = dict(
             schema="fvp-gui-native-linear-chapter-export/1",
             job_schema="fvp-gui-native-chapter-export-job/1", max_scenes=64,

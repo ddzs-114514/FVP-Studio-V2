@@ -355,11 +355,14 @@ class NativeSceneScreenTransition:
         self.binding, self.output = NativeScreenTransition(target.context), output
         self.target = target
         self.chapter_masks = None
+        self.stage_mask_address, self.stage_mask_copy = None, None
+        self.pending_mask, self.pending_mask_code = None, None
         self.snapshot = self.binding.snapshot
         output.extend(self.snapshot["snapshot"])
         self.colour, self.colour_copy = self.binding.prepare_colour(output)
         self.reveal, self.copy = self.binding.prepare_reveal(output)
         self.covered, self.operations = None, []
+        self.parallel_event = None
         self._protected_prefix, self._protected_suffix = b"", b""
         self.portrait_ownership = None
 
@@ -373,13 +376,95 @@ class NativeSceneScreenTransition:
         return self.covered
 
     def restore_compiler_state(self, state):
+        if self.parallel_event is not None or self.pending_mask is not None:
+            raise ValueError('同拍转场结束前不能切换分支状态。')
         self.covered = state
 
+    def begin_mask(self, event):
+        from .gui_screen_transition import mask_values
+        mask_values({k: v for k, v in event.items() if k != 'kind'})
+        if event.get('kind') != 'Transition' or self.parallel_event is not None or self.pending_mask is not None:
+            raise ValueError('原作遮罩必须独占本节拍的一次整幕转场。')
+        if self.chapter_masks is None:
+            from .native_transition_masks import NativeTransitionMasks
+            self.chapter_masks = NativeTransitionMasks(self.binding,
+                self.target.context.abi.native_background_backend, self.target.root)
+        if self.stage_mask_address is None:
+            self.stage_mask_address, self.stage_mask_copy = self.chapter_masks.prepare(self.output, nonblocking=True)
+        start = self.chapter_masks.code(self.stage_mask_address, event['mask'], event['duration_ms'])
+        self.output.extend(self.binding.syscall('DissolveWait', (True,)))
+        self.pending_mask, self.pending_mask_code = deepcopy(event), start
+
+    def take_mask_start(self, event):
+        if self.pending_mask is None:
+            self.begin_mask(event)
+        if event != self.pending_mask:
+            raise ValueError('遮罩准备与本节拍的转场不一致。')
+        self.chapter_masks.check_unchanged()
+        start = self.pending_mask_code
+        self.pending_mask, self.pending_mask_code = None, None
+        return start
+
+    def prepare_parallel(self, event):
+        """Wait for the old dissolve now; return only the new nonblocking start.
+
+        The isolated copies prove that Dissolve is the sole engine effect.
+        Its operands are passed by value. Restore shared script caches before
+        other tracks/dialogue, not after they have legitimately changed them.
+        """
+        if event.get('method') == 'mask':
+            if self.parallel_event is not None:
+                raise ValueError('同拍只能启动一次整幕转场。')
+            start = self.take_mask_start(event)
+            self.parallel_event = deepcopy(event)
+            return self._protected_prefix + start + self._protected_suffix
+        if (self.parallel_event is not None or self.pending_mask is not None
+                or set(event) != {'kind', 'method', 'duration_ms'}
+                or event['kind'] != 'Transition' or event['method'] not in METHODS
+                or type(event['duration_ms']) is not int or not 100 <= event['duration_ms'] <= 3000):
+            raise ValueError('同拍转场需要唯一的黑／白淡出、恢复或往返，单程100～3000毫秒。')
+        self.output.extend(self.binding.syscall('DissolveWait', (True,)))
+        self.parallel_event = deepcopy(event)
+        method = event['method']
+        if method == 'reveal':
+            start = self.binding.reveal_code(self.reveal, event['duration_ms'])
+        else:
+            start = self.binding.colour_code(self.colour,
+                'black' if method.startswith('black') else 'white', event['duration_ms'])
+        return self._protected_prefix + start + self._protected_suffix
+
+    def finish_parallel(self):
+        if self.parallel_event is None:
+            return
+        event = self.parallel_event
+        method, duration = event['method'], event['duration_ms']
+        wait = self.binding.syscall('DissolveWait', (True,))
+        self.output.extend(wait)
+        if method in {'black_return', 'white_return'}:
+            self.output.extend(self._protected_prefix + self.binding.reveal_code(self.reveal, duration)
+                + self._protected_suffix + wait)
+        self.covered = ('black' if method == 'black_out' else 'white' if method == 'white_out' else None)
+        self.operations.append(dict(event, parallel_launch=True, caches_restored_before_companions=True))
+        self.parallel_event = None
+
+    def prepare_background(self, duration):
+        if (self.parallel_event is not None or self.covered is not None
+                or type(duration) is not int or not 1 <= duration <= 6000):
+            raise ValueError('同拍背景渐变需要无遮挡画面、唯一转场和1～6000毫秒时长。')
+        self.output.extend(self.binding.syscall('DissolveWait', (True,)))
+        self.parallel_event = dict(kind='BackgroundReveal', method='reveal', duration_ms=duration)
+        return self._protected_prefix + self.binding.reveal_code(self.reveal, duration) + self._protected_suffix
+
     def emit(self, event):
+        self.finish_parallel()
+        if event.get('method') == 'mask':
+            self.output.extend(self.prepare_parallel(event))
+            self.finish_parallel()
+            return
         if (set(event) != {"kind", "method", "duration_ms"} or event["kind"] != "Transition"
                 or event["method"] not in METHODS or type(event["duration_ms"]) is not int
-                or not 100 <= event["duration_ms"] <= 3000):
-            raise ValueError("整幕转场支持黑／白淡出、淡入和往返，单程 100～3000 毫秒；遮罩转场尚未接通。")
+                or not 100 <= event["duration_ms"] <= 3000 or self.pending_mask is not None):
+            raise ValueError("整幕转场支持黑／白淡出、恢复、往返及目标游戏的原作遮罩，单程 100～3000 毫秒。")
         method, duration = event["method"], event["duration_ms"]
         wait = self.binding.syscall("DissolveWait", (True,))
         self.output.extend(self._protected_prefix + wait)
@@ -394,6 +479,10 @@ class NativeSceneScreenTransition:
         self.output.extend(self._protected_suffix)
 
     def before_background(self, duration):
+        if self.pending_mask is not None:
+            if duration:
+                raise ValueError('遮罩拍内换背景不能再叠加背景渐变。')
+            return False
         if self.covered is not None and duration:
             raise ValueError("黑白场下请直接换背景，再添加淡入恢复画面。")
         return self.covered is None
@@ -418,6 +507,7 @@ class NativeSceneScreenTransition:
                 from .native_transition_masks import NativeTransitionMasks
                 self.chapter_masks = NativeTransitionMasks(self.binding,
                     self.target.context.abi.native_background_backend, self.target.root)
+            if not hasattr(self, 'chapter_mask_address'):
                 self.chapter_mask_address, self.chapter_mask_copy = self.chapter_masks.prepare(self.output)
             self.output.extend(self.chapter_masks.code(self.chapter_mask_address, transition["mask"], duration))
         else:
@@ -429,6 +519,9 @@ class NativeSceneScreenTransition:
         self.operations.append(dict(kind="ChapterTransition", **transition))
 
     def finish(self):
+        if self.pending_mask is not None:
+            raise ValueError('场景结束前尚有未启动的原作遮罩。')
+        self.finish_parallel()
         if self.operations:
             # Remove only this test scene's solid cover before returning. This
             # does not rebuild the inherited story's BG/CG/portrait resources.
@@ -442,6 +535,7 @@ class NativeSceneScreenTransition:
     def report(self):
         return dict(binding=self.binding.report(), colour_copy=deepcopy(self.colour_copy), reveal_copy=deepcopy(self.copy),
             chapter_masks=self.chapter_masks.report() if self.chapter_masks else None,
+            stage_mask_copy=deepcopy(self.stage_mask_copy),
             portrait_ownership=deepcopy(self.portrait_ownership),
             operations=deepcopy(self.operations), waits_each_leg=True,
             removes_scene_cover_at_end=True, original_images_restored=False,

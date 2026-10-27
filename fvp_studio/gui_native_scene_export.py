@@ -41,22 +41,27 @@ from .gui_actor_sway import KINDS as SWAY_KINDS, validate_events as validate_swa
 from .native_portrait_sway import NativePortraitSway
 from .native_audio import NativeAudioBackend
 from .native_audio_bindings import NativeAudioBindings
+from .gui_audio_checkpoint import (REQUEST_FIELD as CHECKPOINT_FIELD,
+    enabled as checkpoint_enabled, bridge_options as checkpoint_bridge_options,
+    require_audio_program, attach_report as attach_checkpoint_report)
 from .native_audio_program import NativeAudioProgram, KINDS as AUDIO_KINDS
+from .gui_movie_program import IMPORT_NAME_RE, NativeMovieBindings, movie_scene_ids
+from .native_movie import NativeMovieProgram
 from .native_rotation_degrees import NativeRotationDegrees
 from .native_scene_camera import NativeSceneCamera
 from .native_scene_background_blur import NativeSceneBackgroundBlur
 from .native_screen_transition import NativeSceneScreenTransition
 from .native_scene_choice_tracks import NativeSceneChoiceTracks, KINDS as CHOICE_KINDS
 from .native_scene_cg import NativeSceneCG
-from .gui_native_cg import KINDS as CG_KINDS
+from .gui_native_cg import KINDS as CG_KINDS, validate_opening_cg
 from .native_vm_backend import _binary_script_evidence
 from .performance_compile import sha
 from .performance_install import TEST_PARENT, _robocopy_executable, _safe, inventory
 
 SCHEMA = "fvp-gui-native-scene-export/1"
 SCOPE = "native_dialogue_hook_new_test_copy"
-FEATURES = {"Scene", "Background", "GuiBackgroundChange", "GuiBackgroundBlur", "Text", "Speech", "Wait", "End", "CameraShot", "Transition"} | PORTRAIT_KINDS | CHOICE_KINDS | AUDIO_KINDS
-CG_EXPORT_KINDS = {"GuiCGLoad", "GuiCGExit", "GuiCGTransform"}
+FEATURES = {"Scene", "Background", "GuiBackgroundChange", "GuiBackgroundBlur", "Text", "Speech", "Wait", "End", "CameraShot", "Transition", "GuiMovie"} | PORTRAIT_KINDS | CHOICE_KINDS | AUDIO_KINDS
+CG_EXPORT_KINDS = CG_KINDS
 
 
 def _filename(value, suffixes):
@@ -221,17 +226,19 @@ def select_hook(context, explicit_offset=None):
     raise ExportError("native_hook_unavailable", "没有找到可安全接入测试场景的原生台词位置。")
 
 
-def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindings=None, motion_contract=None,
+def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindings=None, movie_bindings=None, motion_contract=None,
                   rotation_contract=None, _cg_memory_only=False, cg_source_targets=None,
                   _cg_threaded_memory_only=False,_cg_original_graph_journal=False,
                   _cg_native_state_bridge_out=None, _scene_native_state_bridge_out=None,
-                  _scene_state_binding=None):
+                  _scene_state_binding=None, checkpoint_test=False):
     """Emit target-exact calls; raw CG bytecode needs its matching test EXE.
 
     The scene exporter selects the paired native-state route for CG scenes.
     A raw in-memory caller can still compile libraries without installing
     them; only a matched EXE/HCB pair may enter a new game copy.
     """
+    checkpoint_options = checkpoint_bridge_options(checkpoint_test)
+    require_audio_program(checkpoint_test, program['events'])
     context = target.context
     try:
         validate_sway_events(program['events'])
@@ -240,6 +247,10 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
     from .gui_native_chapter_export import validate_native_chapter_program, ROUTED_SCHEMA
     from .native_chapter_routes import EXIT_KIND, NativeChapterRoutes
     chapter = validate_native_chapter_program(program)
+    try:
+        validate_opening_cg(program, chapter)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ExportError("invalid_cg_setup", str(exc)) from exc
     routed_chapter = chapter is not None and chapter["schema"] == ROUTED_SCHEMA
     from .gui_story_logic import KINDS as LOGIC_KINDS
     story_bank = None
@@ -263,7 +274,7 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             if len(set(actors))!=len(actors):
                 raise ExportError('invalid_parallel_swap','多角色同拍换装不能重复同一个演员。')
             if (any(type(i) is not int or not index < i < len(program['events'])
-                    or program['events'][i]['kind'] not in {'Action','GuiActorMove','GuiActorSlide','CameraShot','GuiBackgroundBlur'}
+                    or program['events'][i]['kind'] not in {'Action','GuiActorMove','GuiActorSlide','CameraShot','GuiBackgroundBlur','Transition'}
                     or (program['events'][i]['kind'] in {'Action','GuiActorMove','GuiActorSlide'} and (
                         type(program['events'][i].get('actor')) is not int
                         or not 1 <= program['events'][i]['actor'] <= 4))
@@ -272,7 +283,9 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                     or len(set(actions))!=len(actions)
                     or any(i not in swaps and i not in actions for i in range(index,max(swaps+actions)+1))):
                 raise ExportError('invalid_parallel_swap','同拍运动须属于本场景已入场的角色，不可跨台词、分支或另一提交组。')
-            if len(swaps)==1 and not any(program['events'][i].get('actor') not in actors for i in actions):
+            if (len(swaps)==1 and not any(program['events'][i].get('actor') not in actors for i in actions)
+                    and not any(isinstance(g, dict) and g.get('launch_index') == index
+                        for g in program.get('native_parallel_backgrounds', []))):
                 raise ExportError('invalid_parallel_swap','单角色自身运动应使用原有成对启动，不建立空的其他角色批次。')
             batch_swaps[index] = [program['events'][i] for i in swaps]
             batch_actions[index] = [program['events'][i] for i in actions]
@@ -308,6 +321,29 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             raise ExportError('invalid_parallel_cg', 'CG 同拍提交必须是本节拍连续的一次加载与一次构图。')
         cg_groups[indexes[0]] = program['events'][indexes[1]]
         cg_consumed[indexes[1]] = indexes[0]
+    from .native_parallel_beat import bind_groups as bind_beat_groups, bind_backgrounds, launch_stage
+    from .gui_screen_transition import bind_mask_beats
+    occupied = (set(parallel_swaps) | set(parallel_consumed) | set(batch_swaps) | set(batch_consumed)
+        | set(motion_groups) | set(motion_consumed) | set(cg_groups) | set(cg_consumed))
+    try:
+        stage_groups, stage_consumed = bind_beat_groups(program['events'],
+            program.get('native_parallel_stage', []), occupied=occupied)
+        cg_lines, cg_line_ends = bind_beat_groups(program['events'],
+            program.get('native_cg_exit_lines', []),
+            occupied=occupied | set(stage_groups) | set(stage_consumed), cg_lines=True)
+        background_loads, background_starts, background_ends = bind_backgrounds(program['events'],
+            program.get('native_parallel_backgrounds', []))
+        consumed = set(parallel_consumed) | set(batch_consumed) | set(motion_consumed) | set(stage_consumed)
+        if set(background_starts) & consumed:
+            raise ValueError('背景渐变必须使用所属节拍的共同启动入口。')
+        mask_starts = bind_mask_beats(program['events'], program.get('native_mask_transitions', []))
+        launch_owners = {**parallel_consumed, **batch_consumed, **motion_consumed, **stage_consumed}
+        for start, group in mask_starts.items():
+            end = group['transition_index']
+            if start in consumed or launch_owners.get(end, end) < start:
+                raise ValueError('遮罩须在本拍资源准备和共同启动之前准备，不能从其他提交组中途开始。')
+    except ValueError as exc:
+        raise ExportError('invalid_parallel_beat', str(exc)) from exc
     if any(type(v) is not bool for v in (_cg_memory_only,_cg_threaded_memory_only,_cg_original_graph_journal)):
         raise ExportError("invalid_cg_compile_mode", "CG 内存编译模式须由本机明确选择。")
     has_cg = any(e["kind"] in CG_KINDS for e in program["events"])
@@ -322,7 +358,14 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
         raise ExportError("invalid_scene_state_mode", "普通场景状态恢复须同时提供配对接口结果容器。")
     threaded_state = _cg_threaded_memory_only or scene_state is not None
     has_sway = any(e['kind'] in SWAY_KINDS for e in program['events'])
-    has_audio = any(e['kind'] in AUDIO_KINDS for e in program['events'])
+    has_movie = any(e['kind'] == 'GuiMovie' for e in program['events'])
+    has_audio = has_movie or any(e['kind'] in AUDIO_KINDS for e in program['events'])
+    try:
+        movie_scenes = movie_scene_ids(program,chapter)
+    except ValueError as exc:
+        raise ExportError('native_movie_scope',str(exc)) from exc
+    if has_movie and (not threaded_state or not isinstance(movie_bindings, NativeMovieBindings)):
+        raise ExportError('native_movie_state_required', '影片须配对本目标的素材、原生画面及音频恢复接口。')
     if has_audio and (not threaded_state or not isinstance(audio_bindings, NativeAudioBindings)):
         raise ExportError('native_audio_state_required', '通用声音须配对本目标的原生状态接口和声音素材。')
     if has_sway and not threaded_state:
@@ -334,6 +377,8 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
     if motion_groups and not threaded_state:
         raise ExportError('native_parallel_motion_state_required',
             '普通移动与缩放或景深同拍，需要本目标配对的原生状态接口；不会改为串行输出。')
+    if (stage_groups or cg_lines or background_loads) and not threaded_state:
+        raise ExportError('native_parallel_beat_state_required', '同拍舞台与CG台词需要当前目标配对的原生状态接口。')
     if _cg_threaded_memory_only and (not _cg_memory_only or not has_cg):
         raise ExportError("invalid_cg_compile_mode", "CG 线程整场景装配只能用于私有 CG 内存编译。")
     if _cg_original_graph_journal and not _cg_threaded_memory_only:
@@ -360,6 +405,7 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
     cg = None
     sway = None
     audio = None
+    movie = None
     if has_cg:
         try:
             cg = NativeSceneCG(target, code, graphics_imports, source_targets=cg_source_targets,
@@ -369,7 +415,18 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                                **(dict(use_original_graph_journal=True) if _cg_original_graph_journal else {}))
         except (ValueError, KeyError) as exc:
             raise ExportError("native_cg_memory_binding_rejected", str(exc)) from exc
-    if any(e["kind"] in {"Transition", "GuiCGExit"} for e in program["events"]):
+    if has_audio:
+        try:
+            NativeAudioProgram.capture_original_audio(target,cg or scene_state,audio_bindings.native,code)
+        except (ValueError,KeyError) as exc:
+            raise ExportError('native_audio_snapshot_rejected',str(exc)) from exc
+    if has_movie:
+        try:
+            movie = NativeMovieProgram(target, cg or scene_state, program['events'], code, movie_bindings, audio_bindings.native)
+        except (ValueError, KeyError) as exc:
+            raise ExportError('native_movie_not_connected', str(exc)) from exc
+    if has_movie or background_loads or any(e["kind"] in {"Transition", "GuiCGExit"}
+            or e['kind'] in CG_KINDS and 'transition' in e for e in program["events"]):
         try:
             screen = NativeSceneScreenTransition(target, code)
         except (ValueError, KeyError) as exc:
@@ -447,12 +504,23 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             raise ExportError("native_scene_state_dialogue_rejected", str(exc)) from exc
     if has_audio:
         try:
-            audio = NativeAudioProgram(target, cg or scene_state, program['events'], code, audio_bindings)
+            audio_events = program['events']
+            if has_movie:
+                # Allocation only: the native movie wrapper performs its own
+                # BGM stop. The movie emitter marks actual route ownership.
+                audio_events = [*audio_events, dict(kind='GuiBGM', op='keep', source=None, archive=None,
+                    resource=None, sha256=None, volume=100, loop=False, duration_ms=0)]
+            audio = NativeAudioProgram(target, cg or scene_state, audio_events, code, audio_bindings)
         except (ValueError, KeyError) as exc:
             raise ExportError('native_audio_not_connected', str(exc)) from exc
     if (camera or portrait_scene or blur or screen or cg or audio) and ([e["kind"] for e in program["events"]].count("End") != 1
             or program["events"][-1]["kind"] != "End"):
         raise ExportError("invalid_scene_end", "使用镜头或立绘的测试场景须只有一个结束节点，并放在最后。")
+    if movie:
+        try:
+            movie.prepare_helpers(screen,chapter,movie_scenes)
+        except (ValueError,KeyError) as exc:
+            raise ExportError('native_movie_handoff_rejected',str(exc)) from exc
     if routed_chapter and chapter.get("variables"):
         from .native_story_variables import NativeStoryVariableBank
         try:
@@ -468,6 +536,7 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                 portraits=portrait_scene, camera=camera, blur=blur, screen=screen,
                 audio=audio,
                 **(dict(boundary_ms=chapter["boundary_ms"], story_bank=story_bank,
+                    movie_handoff=movie.handoff if movie else None,
                     subroutine_entries=any("transition" in r for r in chapter["routes"]),
                     menu_required=(any(r["mode"] == "choice" for r in chapter["routes"])
                         or any(e["kind"] in CHOICE_KINDS for e in program["events"]))) if routed_chapter else {}),
@@ -503,6 +572,10 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
     lines = 0
     for index, event in enumerate(program["events"]):
         kind, before = event["kind"], len(code)
+        if index in stage_consumed:
+            events.append(dict(event_index=index, kind=kind, byte_range=[before, before],
+                compiled_with_native_stage=stage_consumed[index], native_parallel_launch=True))
+            continue
         if index in cg_consumed:
             events.append(dict(event_index=index,kind=kind,byte_range=[before,before],
                 compiled_with_native_cg=cg_consumed[index],native_parallel_launch=True))
@@ -524,6 +597,23 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             continue
         if kind not in FEATURES | (CG_KINDS if cg else set()) | ({EXIT_KIND} | LOGIC_KINDS if routed_chapter else set()):
             raise ExportError("generic_feature_not_connected", f"其他游戏的 {kind} 输出尚未接通，场景不会被删减输出。")
+        if index in mask_starts:
+            try:
+                for owner in (portrait_scene, camera, blur):
+                    if owner is not None:
+                        owner.join()
+                screen.begin_mask(program['events'][mask_starts[index]['transition_index']])
+            except (ValueError, KeyError, OSError) as exc:
+                raise ExportError('native_stage_mask_rejected', str(exc), issues=[dict(
+                    level='error', code='native_stage_mask_rejected', event_index=index,
+                    kind=kind, message=str(exc))]) from exc
+        if sway:
+            sway.before_event(event)
+            # Group members are emitted at their first event and skipped
+            # later. Join every affected actor before launching the group.
+            for group in (stage_groups, motion_groups, batch_swaps, batch_actions, parallel_swaps):
+                for member in group.get(index, ()):
+                    sway.before_event(member)
         if cg:
             try:
                 cg.assert_stage_event(kind)
@@ -531,6 +621,14 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                 raise ExportError("native_cg_stage_event_rejected", str(exc), issues=[dict(
                     level="error", code="native_cg_stage_event_rejected", event_index=index,
                     kind=kind, message=str(exc))]) from exc
+        background_launch = None
+        if index in background_starts:
+            group = background_starts[index]
+            background_launch = screen.prepare_background(program['events'][group['background_index']]['duration_ms'])
+            if index not in stage_groups and index not in batch_swaps:
+                if kind not in {'Text', 'Speech', 'GuiVoiceLine', 'Wait'}:
+                    raise ExportError('invalid_parallel_background', '背景渐变没有绑定本拍完整运动组。')
+                code.extend(background_launch)
         if (routed_chapter and choices.subroutine_entries
                 and index in {r["setup_end"] for r in chapter["scenes"]}):
             choices.ready()
@@ -582,6 +680,15 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             if kind in {"Choice", "GuiChoice"}:
                 lines += 1
             details = dict(target_native_choice=True)
+        elif index in stage_groups:
+            try:
+                if cg:
+                    for member in stage_groups[index]:
+                        cg.assert_stage_event(member['kind'])
+                details = launch_stage(stage_groups[index], portraits=portrait_scene,
+                    camera=camera, blur=blur, screen=screen, background_launch=background_launch)
+            except (ValueError, KeyError) as exc:
+                raise ExportError('native_parallel_stage_rejected', str(exc)) from exc
         elif kind in CG_KINDS:
             try:
                 if camera:
@@ -590,7 +697,9 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                     portrait_scene.join()
                 if blur:
                     blur.join()
-                if index in cg_groups:
+                if index in cg_lines:
+                    cg.begin_exit_line(event)
+                elif index in cg_groups:
                     cg.emit_load_with_transform(event,cg_groups[index])
                 else:
                     cg.emit(event)
@@ -601,6 +710,8 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             details = dict(target_native_cg_memory_assembly=True, public_export_connected=False)
             if index in cg_groups:
                 details.update(native_parallel_launch=True, native_cg_motion_before_reveal_wait=True)
+            if index in cg_lines:
+                details.update(native_parallel_launch=True, cleanup_after_line=True)
         elif kind in PORTRAIT_KINDS:
             try:
                 if kind == POSE_KIND and (screen is None or screen.covered is None):
@@ -612,14 +723,15 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                 elif index in motion_groups:
                     portrait_scene.motion_batch(motion_groups[index])
                 elif index in batch_swaps:
-                    stage_events = [e for e in batch_actions[index] if e['kind'] in {'CameraShot','GuiBackgroundBlur','GuiActorSlide'}
-                        or e['kind']=='Action' and e.get('channels')=='alpha']
+                    stage_events = [e for e in batch_actions[index] if e['kind'] in {'CameraShot','GuiBackgroundBlur','GuiActorSlide','Transition'}
+                        or e['kind']=='Action' and e.get('channels') in {'alpha', 'parts'}]
                     if stage_events:
                         portrait_scene.join()
                         if camera:
                             camera.join()
                     portrait_scene.swap_batch(batch_swaps[index],parallel_events=[e for e in batch_actions[index]
-                        if e not in stage_events],stage_events=stage_events,blur=blur)
+                        if e not in stage_events],stage_events=stage_events,blur=blur,screen=screen,
+                        background_launch=background_launch)
                 else:
                     portrait_scene.emit(event, **(dict(parallel_events=parallel_swaps[index])
                         if index in parallel_swaps else {}))
@@ -634,8 +746,12 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             if kind == POSE_KIND:
                 details.update(instantaneous_pose_set=True, motion_zero_used=False)
             if index in motion_groups:
+                from .native_portrait_motion_group import split_motion_events
+                _geometry, companions = split_motion_events(motion_groups[index])
                 details.update(native_parallel_launch=True,
                     native_parallel_action_count=len(motion_groups[index]),
+                    native_parallel_companion_count=len(companions),
+                    native_parallel_companion_channels=sorted({e['channels'] for e in companions}),
                     native_current_buffer_only=True, native_complete_apply_count=0)
             if index in parallel_swaps:
                 details.update(native_parallel_launch=True, native_parallel_action_count=len(parallel_swaps[index]))
@@ -677,7 +793,8 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                 raise ExportError("native_background_under_cover_rejected", str(exc)) from exc
             options = {} if transition else dict(transition=False)
             load = backend.compile_load(context.document, resource_name=name,
-                archive_name=archive, duration_ms=duration, **options)
+                archive_name=archive, duration_ms=0 if index in background_loads else duration,
+                **(dict(transition=False) if index in background_loads else options))
             code.extend(load.code)
             if portrait_scene:
                 portrait_scene.reset_camera()
@@ -691,6 +808,9 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             if cg:
                 cg.background_loaded(dict(target_archive=archive, target_resource_name=name))
             details = dict(native_background=load.report)
+            if index in background_loads:
+                details.update(native_background_fade_deferred=True, duration_ms=duration,
+                    launch_event_index=background_loads[index]['launch_index'])
         elif kind == "Transition":
             if camera:
                 camera.join()
@@ -744,8 +864,11 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                     speaker_id=speaker, text=event["text"], voice_id=None)],
                 audio.native.voice.dialogue_abi if kind == 'GuiVoiceLine' else context.abi,
                 analysis_document=context.analysis_document,
+                before_print_bytes=audio.voice_before_print(event) if kind == 'GuiVoiceLine' else b'',
                 after_print_bytes=audio.voice_start(event) if kind == 'GuiVoiceLine' else b'')
-            if cg:
+            if kind == 'GuiVoiceLine' and audio.voice_dialogue is not None:
+                payload = audio.voice_dialogue.rewrite(payload)
+            elif cg:
                 payload = cg.dialogue.rewrite(payload)
             elif scene_state is not None:
                 payload = scene_state.dialogue.rewrite(payload)
@@ -754,8 +877,18 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             code.extend(payload)
             if kind == 'GuiVoiceLine':
                 code.extend(audio.voice_end())
+            if index in cg_line_ends:
+                cg.finish_exit_line()
             lines += 1
             details = dict(native_dialogue=dialogue_report)
+            if index in cg_line_ends:
+                details['cg_exit_completed_after_line'] = True
+        elif kind == 'GuiMovie':
+            try:
+                movie.emit(event, audio, event_index=index)
+            except (ValueError, KeyError) as exc:
+                raise ExportError('native_movie_event_rejected', str(exc)) from exc
+            details = dict(target_native_movie=True, native_end_wait=True, estimate_is_not_timeout=True)
         elif kind in AUDIO_KINDS:
             try:
                 audio.emit(event)
@@ -793,11 +926,14 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                 blur.finish()
             if screen:
                 screen.finish()
+            if movie:
+                movie.finish()
             if scene_state is not None:
                 scene_state.finish()
             if audio:
-                # Clear the original wrapper's cached IDs AFTER script-state
-                # restoration; a restored stale ID must not suppress its next play.
+                # Cleanup authored slots first. A paired audio bridge restores
+                # original caches along with retained native decoders; without
+                # one, keep the legacy cache invalidation behavior.
                 audio.finish()
             details = dict(allocated_portraits_cleared=bool(portrait_scene),
                 allocated_cg_cleared=bool(cg), script_state_restored=bool(portrait_scene or camera or blur or screen))
@@ -815,8 +951,11 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             if kind == "Wait" and cg:
                 cg.join()
                 details["target_native_cg_joined"] = True
+        if index in background_ends:
+            screen.finish_parallel()
+            details['native_background_fade_completed'] = True
         events.append(dict(event_index=index, kind=kind, byte_range=[before, len(code)], **details))
-    if not lines:
+    if not lines and not movie:
         raise ExportError("missing_dialogue", "测试场景需要至少一句台词作为可见的停留点。")
     patch = anchor["patch"]
     offset, expected = int(patch["patch_offset"]), bytes.fromhex(patch["expected_hex"])
@@ -872,7 +1011,7 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
         native_background_backend=backend.describe(),
         limitations=["启动后进入原生剧情，在报告指定台词前播放测试场景；并非独立开机直接试演",
                      "结束后接回原生剧情；旧剧情画面重建、音乐和章节交接仍需补齐",
-                     "CG 尚未接入此通用输出；整幕黑白转场与换装渐变按目标原生绑定，遮罩转场及未匹配的动作会明确拒绝",
+                     "整幕转场、原作遮罩及换装渐变按目标原生绑定；未匹配的资源和动作会明确拒绝，不会省略",
                      "跨游戏背景保留原 HZC 像素并使用目标原生几何默认值；不同画幅的显示仍需实机确认"])
     if portrait_scene:
         report.update(native_portraits=portrait_scene.report(),
@@ -887,12 +1026,22 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
         report["limitations"].append("镜头使用目标原生运动和参考景深；尚未实机确认旧剧情接回后的完整画面恢复。")
     if sway:
         report['native_actor_sway'] = sway.report()
+        from .gui_actor_nod import KIND as NOD, contract as nod_contract
+        if any(e['kind'] == NOD for e in program['events']):
+            report['native_actor_nod'] = dict(**nod_contract(), compiled=True,
+                operations=[v for v in sway.operations if v['kind'] == NOD])
     if audio:
         report['native_audio'] = dict(audio.report(), scene_export_connected=True,
             chapter_mainline_connected=True, local_choice_branch_connected=bool(choices))
         report['audio_bindings'] = audio_bindings.report()
         report['resource_pack_changed'] |= bool(audio_bindings.groups)
-        report['limitations'].append('声音只执行选中路线；配音使用目标原生人声槽和台词等待，进入下一句即停止。回看重播配音、原剧情音频播放位置恢复尚未接入。')
+        report['limitations'].append('声音只执行选中路线；配音使用目标原生人声槽和台词等待，进入下一句即停止。原剧情音频续播状态以本次配套原生接口报告为准。')
+    if movie:
+        report['native_movie'] = movie.report()
+        report['limitations'].append('影片支持已登记来源，外部来源的所选文件以独立名称复制到新测试副本，不覆盖原作影片；类型须匹配目标原作，不转码，解码兼容仍待实机确认。仅限独立 OP 场景，可串入通用章节；每场可顺序放置多段影片，段间直切；选项／条件出口请放在相邻普通场景。按原作实际结束等待，不按估计时长截断。实机播放、跳过和交接尚待验收。')
+        for reference, asset in movie_bindings.assets.items():
+            if not asset['imported']:
+                stamps[reference[1]] = asset['stamp']
     if choices:
         report["native_chapter_routes" if routed_chapter else "native_choices"] = choices.report()
         report["limitations"].append(
@@ -908,6 +1057,9 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
         report["limitations"].append("背景模糊使用来源原作的配对图和目标原生透明度渐变；不生成模糊图，原剧情图像重建尚未接完。")
     if screen:
         report["native_screen_transition"] = screen.report()
+        if mask_starts:
+            report['native_screen_transition']['ordinary_mask_beats'] = deepcopy(list(mask_starts.values()))
+            report['native_screen_transition']['mask_owns_background_reveal'] = True
         report.update(original_visual_state_inherited=False, original_engine_resources_restored=False)
         report["limitations"].append("黑白转场保留目标原生快进／时长设置，不改角色和镜头；结束时移除测试场景色场，不代表旧剧情图像已重建。")
     if cg:
@@ -919,7 +1071,8 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
     if _cg_threaded_memory_only:
         try:
             payload,thread_image = cg.prepare_threaded_scene_image(bytes(payload),anchor,
-                _defer_preserved_source_cycles=_cg_native_state_bridge_out is not None)
+                _defer_preserved_source_cycles=_cg_native_state_bridge_out is not None,
+                **(dict(voice_replay=audio.backlog) if audio and audio.backlog else {}))
         except (ValueError,KeyError) as exc:
             raise ExportError("native_cg_thread_image_rejected",str(exc)) from exc
         report.update(native_cg=cg.report(),native_cg_thread_image=thread_image,
@@ -938,21 +1091,28 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
                     cg.group_ancestry.native_groups.report(),
                     cg.presentation.motion_quiescence.native_binding.report(),
                     thread_image['native_vm_syscall_catalogue'],
-                    original_volatile_globals=context.analysis_document.header.volatile_globals)
+                    original_volatile_globals=context.analysis_document.header.volatile_globals,
+                    audio_resume=audio.resume if audio else None, **checkpoint_options)
                 payload,bridge_report=link_state_bridge(payload,thread_image,bridge,
                     encoding=context.document.encoding)
             except (ValueError,KeyError) as exc:
                 raise ExportError('native_cg_state_bridge_rejected',str(exc)) from exc
             _cg_native_state_bridge_out.update(executable=bridge.executable,report=bridge_report)
             report.update(native_cg_state_bridge=bridge_report,output=dict(hcb_sha256=sha(payload)))
+            if audio:
+                audio.link_resume(bridge_report)
     if scene_state is not None:
         try:
             payload, thread_image = scene_state.prepare_threaded_scene_image(bytes(payload), anchor,
-                _defer_preserved_source_cycles=True)
-            payload, bridge = scene_state.build_bridge(payload, thread_image)
+                _defer_preserved_source_cycles=True,
+                **(dict(voice_replay=audio.backlog) if audio and audio.backlog else {}))
+            payload, bridge = scene_state.build_bridge(payload, thread_image,
+                **(dict(checkpoint_test=True) if checkpoint_test else {}))
         except (ValueError, KeyError) as exc:
             raise ExportError("native_scene_state_bridge_rejected", str(exc)) from exc
         _scene_native_state_bridge_out.update(bridge)
+        if audio:
+            audio.link_resume(bridge['report'])
         report.update(native_scene_state=scene_state.report(), native_scene_thread_image=thread_image,
             native_scene_state_bridge=bridge['report'],
             output=dict(hcb_sha256=sha(payload)), new_instruction_count=thread_image['new_instruction_count'],
@@ -963,17 +1123,36 @@ def compile_scene(target, program, anchor, *, graphics_imports=None, audio_bindi
             original_scene_native_restore_connected=True, requires_matching_new_test_executable=True)
         report['native_scene_state']['scene_export_connected'] = True
         report['limitations'].append("普通场景已接入配套测试程序的原剧情资源、动画与镜头恢复；尚未实机验收，不代表原剧情画面已确认恢复。")
+    if audio:
+        if audio.resume is not None and not audio.resume_linked:
+            raise ExportError('native_audio_resume_not_linked','精确续播必须同时生成配套测试 EXE，不能单独输出脚本。')
+        report['native_audio'].update(audio.report(), scene_export_connected=True)
+        report['limitations'].append('原剧情音频已接入原对象保留与断点续播；实际听感和存读档仍未验收。'
+            if audio.resume_linked else '原剧情音频精确续播未匹配：'+str(audio.resume_blocker or '缺少配套原生状态接口'))
+        if audio.backlog is not None and not audio.backlog.patches:
+            raise ExportError('native_voice_backlog_not_linked', '回看配音缺少配套场景装配，不能输出半接入的副本。')
+        if 'voice' in audio.flags:
+            report['limitations'].append('回看配音已接入原生记录和回放链，实机回看及存读档仍待验收。'
+                if audio.backlog else '此目标仅接入正文配音；回看配音尚未匹配：'+str(audio.backlog_blocker))
+            current = audio.backlog.current if audio.backlog else None
+            if current is not None and not current.patches:
+                raise ExportError('native_voice_current_not_linked', '当前句重播缺少配套场景调用，不能输出半接入副本。')
+            report['limitations'].append('当前句配音重播已接入原生入口；没有新增快捷键，实机按钮／键位与听感仍待验收。'
+                if current else '当前句配音重播未匹配；正文播放与已匹配的回看重播不受影响。')
     if chapter is not None:
         report["limitations"] = [s for s in report["limitations"]
             if s != "结束后接回原生剧情；旧剧情画面重建、音乐和章节交接仍需补齐"]
-        report["limitations"].append("章节按来源场景的出口转场衔接（旧工程默认黑场 800ms）；变量、条件和循环路线已接编译，声音仍未接入。")
+        report["limitations"].append("章节按来源场景的出口转场衔接（旧工程默认黑场 800ms）；变量、条件和循环路线已接编译，声音按目标已匹配的能力输出。")
         report["native_chapter"] = dict(chapter, one_native_state_capture=True,
             original_story_resumed_only_after_final_scene=True, standalone_startup=False,
             cross_chapter_explicit_jumps=True, branches_supported=bool(routed_chapter),
             source_exit_transitions=bool(routed_chapter and choices.subroutine_entries),
+            movie_scene_ids=sorted(movie_scenes), movie_handoff_connected=bool(movie),
             scene_exit_choices_supported=True, local_beat_choices_supported=True,
             variables_supported=True, conditional_routes_supported=True, loops_supported=True,
             cg_supported=True, cg_used=bool(cg), runtime_verified=False)
+    attach_checkpoint_report(report, checkpoint_test,
+        report.get('native_cg_state_bridge') or report.get('native_scene_state_bridge'))
     return bytes(payload), report, stamps
 
 
@@ -987,6 +1166,7 @@ class BuiltScene:
     issues: list
     archive_files: dict = field(default_factory=dict)
     native_executable: bytes | None = None
+    movie_files: dict = field(default_factory=dict)
 
 
 def bind_cg_sources(runtime, target, events):
@@ -997,7 +1177,7 @@ def bind_cg_sources(runtime, target, events):
     """
     bound = {}
     for event in events:
-        if event["kind"] != "GuiCGLoad":
+        if event["kind"] not in {"GuiCGSetup", "GuiCGLoad"}:
             continue
         key, root = event["source_game"], Path(event["archive"]).resolve().parent
         source = runtime.sources.get(key)
@@ -1033,6 +1213,7 @@ class NativeSceneExporter:
             native_export_target=True, native_rotation_converter=native_rotation_converter)
 
     def build(self, request, update, *, _cg_native_state_candidate=None, _scene_native_state_candidate=None):
+        checkpoint_test = checkpoint_enabled(request)
         if _cg_native_state_candidate is not None and type(_cg_native_state_candidate) is not bool:
             raise ExportError("invalid_cg_compile_mode", "CG 测试副本须由本机明确选择。")
         if _scene_native_state_candidate is not None and type(_scene_native_state_candidate) is not bool:
@@ -1067,6 +1248,7 @@ class NativeSceneExporter:
                             message=f"当前目标的 {event['kind']} 输出尚未接通，不能省略后生成。"))
         if issues:
             raise ExportError("scene_needs_changes", "当前场景有内容尚不能输出到该游戏。", issues=issues)
+        require_audio_program(checkpoint_test, program['events'])
         source = source_for_request(self.runtime, request)
         update("compiling", "正在按目标游戏的原生调用生成场景…")
         target = bound.get("target") or bind_target(source)
@@ -1089,8 +1271,8 @@ class NativeSceneExporter:
             cg_sources = bind_cg_sources(self.runtime, target, program["events"])
             native_state={}
         scene_state, restore_pending = None, None
-        visual_kinds = PORTRAIT_KINDS | AUDIO_KINDS | {"Background", "GuiBackgroundChange", "GuiBackgroundBlur", "CameraShot", "Transition"}
-        ordinary_state_requested = (_scene_native_state_candidate is True or
+        visual_kinds = PORTRAIT_KINDS | AUDIO_KINDS | {"Background", "GuiBackgroundChange", "GuiBackgroundBlur", "CameraShot", "Transition", "GuiMovie"}
+        ordinary_state_requested = (checkpoint_test or _scene_native_state_candidate is True or
             _scene_native_state_candidate is None and isinstance(target, BoundTarget)
             and any(e['kind'] in visual_kinds for e in program['events']))
         if not _cg_native_state_candidate and ordinary_state_requested:
@@ -1100,15 +1282,20 @@ class NativeSceneExporter:
                 native_state = {}
             except (ValueError, KeyError) as exc:
                 restore_pending = str(exc)
-        if self.requires_paired_scene_state and scene_state is None and not _cg_native_state_candidate:
+        if (self.requires_paired_scene_state or checkpoint_test) and scene_state is None and not _cg_native_state_candidate:
             raise ExportError("native_chapter_state_required", "此目标尚不能完整接通章节的原生状态保存／恢复。" + (restore_pending or ""))
         imports=NativeGraphicsImports(target.root,import_routes)
-        audio_bindings = None
-        if any(e['kind'] in AUDIO_KINDS for e in program['events']):
+        audio_bindings = movie_bindings = None
+        if any(e['kind'] in AUDIO_KINDS | {'GuiMovie'} for e in program['events']):
             try:
                 audio_bindings = NativeAudioBindings(target, NativeAudioBackend(target.context), builder.resources)
             except (ValueError, KeyError) as exc:
                 raise ExportError('native_audio_not_connected', str(exc)) from exc
+        if any(e['kind'] == 'GuiMovie' for e in program['events']):
+            try:
+                movie_bindings = NativeMovieBindings(target, builder.resources)
+            except (ValueError, KeyError) as exc:
+                raise ExportError('native_movie_not_connected', str(exc)) from exc
         resources = NativeExportResources(builder.resources, imports)
         compile_options = (dict(_cg_memory_only=True,_cg_threaded_memory_only=True,
                     _cg_original_graph_journal=True,_cg_native_state_bridge_out=native_state,
@@ -1116,11 +1303,14 @@ class NativeSceneExporter:
             if _cg_native_state_candidate else
             dict(_scene_state_binding=scene_state, _scene_native_state_bridge_out=native_state)
             if scene_state is not None else {})
+        if checkpoint_test:
+            compile_options['checkpoint_test'] = True
         try:
             payload, report, resource_stamps = compile_scene(target, program, anchor, graphics_imports=imports,
-                audio_bindings=audio_bindings, rotation_contract=bound.get("rotation"), **compile_options)
+                audio_bindings=audio_bindings, movie_bindings=movie_bindings,
+                rotation_contract=bound.get("rotation"), **compile_options)
         except ExportError as exc:
-            if scene_state is None or self.requires_paired_scene_state or audio_bindings is not None:
+            if checkpoint_test or scene_state is None or self.requires_paired_scene_state or audio_bindings is not None:
                 raise
             # This is an optional restoration enhancement, not an authored
             # scene feature. Unsupported native state layouts retain the SAME
@@ -1161,6 +1351,7 @@ class NativeSceneExporter:
         folder = self.output_root / ("native-scene-" + report["plan_sha256"][:12] + "-" + secrets.token_hex(8))
         folder.mkdir(exist_ok=False)
         update("publishing", "正在保存场景文件…", output=dict(candidate_directory=str(folder)))
+        movie_files = {}
         try:
             archive_files, archive_sources, archive_outputs = imports.publish(folder)
             archive_reports = dict(imports.reports)
@@ -1174,6 +1365,11 @@ class NativeSceneExporter:
                     for name,v in sound_outputs.items()})
                 archive_reports.update(sound_reports)
                 report['audio_bindings'] = dict(audio_bindings.report(), scene_export_connected=True)
+            if movie_bindings is not None:
+                movie_files, movie_outputs = movie_bindings.publish(folder)
+                report['movie_imports'] = dict(outputs=movie_outputs,
+                    new_test_copy_only=True, originals_modified=False,
+                    transcoded=False, decoder_compatibility_verified=False, runtime_verified=False)
         except ValueError as exc:
             raise ExportError("resource_pack_failed", str(exc)) from exc
         report.update(resource_archives=dict(sources=archive_sources, outputs=archive_outputs,
@@ -1200,13 +1396,24 @@ class NativeSceneExporter:
             warnings.append(dict(level="warn", code="native_story_visual_restore_pending", scene_id=scene["id"],
                 message="旧剧情画面尚不能完整恢复；请只在新副本验收当前场景。"))
         if audio_bindings is not None:
-            warnings.append(dict(level='warn',code='native_story_audio_restore_pending',scene_id=scene['id'],
-                message='声音只在新测试副本验收；结束时清理本次使用的声音类型，尚不恢复原剧情声音和播放位置。'))
-            if report.get('native_audio',{}).get('voice_connected'):
+            connected=report.get('native_audio',{}).get('original_playback_restore_connected',False)
+            warnings.append(dict(level='warn',code='native_story_audio_restore_runtime_pending' if connected else 'native_story_audio_restore_pending',scene_id=scene['id'],
+                message='原剧情音频断点续播后端已接入；仅限配套新测试副本，听感与存读档尚待验收。' if connected else
+                    '此目标未匹配音频断点续播；结束时仅清理测试场景声音，不声称恢复原剧情播放位置。'))
+            if (report.get('native_audio',{}).get('voice_connected')
+                    and not report['native_audio'].get('voice_backlog_replay')):
                 warnings.append(dict(level='warn',code='native_voice_backlog_pending',scene_id=scene['id'],
                     message='配音随台词播放，切到下一句即停止；回看中的配音重播尚未接入。'))
+            elif report.get('native_audio',{}).get('voice_backlog_replay'):
+                warnings.append(dict(level='warn',code='native_voice_backlog_runtime_pending',scene_id=scene['id'],
+                    message='回看配音记录与回放已接入后端；实际回看、存读档效果仍需在新测试副本验收。'))
+            if report.get('native_audio',{}).get('voice_connected'):
+                current = report['native_audio'].get('voice_current_line_replay', False)
+                warnings.append(dict(level='warn',code='native_voice_current_runtime_pending' if current else 'native_voice_current_pending',scene_id=scene['id'],
+                    message='当前句重播已接入原作入口，未新增快捷键；实际操作与听感仍待新测试副本验收。' if current else
+                        '此目标的当前句配音重播尚未匹配，不影响正文播放和已支持的回看重播。'))
         return BuiltScene(folder, payload, report, target, resources, warnings, archive_files,
-                          native_state["executable"] if native_state is not None else None)
+                          native_state["executable"] if native_state is not None else None, movie_files)
 
     def install(self, built, update, *, _cg_native_state_candidate=None):
         if _cg_native_state_candidate is None:
@@ -1248,6 +1455,17 @@ class NativeSceneExporter:
             _filename(name, {".bin"})
             if Path(path).resolve() != (folder / name).resolve() or _file_identity(path) != archive_outputs[name]:
                 raise ExportError("candidate_changed", "保存的素材包与生成结果不一致。")
+        movie_imports = built.report.get('movie_imports', {})
+        movie_outputs = movie_imports.get('outputs', {})
+        if set(built.movie_files) != set(movie_outputs):
+            raise ExportError('candidate_changed', '生成的影片文件清单不完整。')
+        for name, path in built.movie_files.items():
+            if (not isinstance(name, str) or not IMPORT_NAME_RE.fullmatch(name)
+                    or Path(path).resolve() != (folder/name).resolve()
+                    or _file_identity(path) != movie_outputs[name]):
+                raise ExportError('candidate_changed', '保存的影片与生成结果不一致。')
+        if {name.casefold() for name in built.movie_files} & {p.name.casefold() for p in root.iterdir()}:
+            raise ExportError('movie_name_conflict', '新增影片名称已存在于目标游戏，请重新生成；不会覆盖原文件。')
         built.target.check_unchanged()
         built.resources.check_unchanged()
         robocopy = _robocopy_executable()
@@ -1271,6 +1489,7 @@ class NativeSceneExporter:
         required = (sum(v["size"] for v in original.values()) + len(built.payload)*2
                     + (len(built.native_executable)*2 if paired_state else 0)
                     + sum(v["size"] + archive_sources[n]["size"] for n, v in archive_outputs.items())
+                    + sum(v['size'] for v in movie_outputs.values())
                     + 512*1024**2)
         if shutil.disk_usage(self.test_parent).free < required:
             raise ExportError("disk_full", "测试盘空间不足，已保留生成文件。")
@@ -1304,11 +1523,23 @@ class NativeSceneExporter:
         if sha(original_script) != built.report["source"]["hcb_sha256"]:
             raise ExportError("copy_changed", "新副本中的脚本发生变化，已停止写入。")
         # Prepare and verify every replacement before changing anything.
-        # Additive BINs and the matching native EXE commit before the referring
+        # Imported movies, additive BINs and the matching native EXE commit before the referring
         # HCB, which commits LAST. If a
         # later step fails, this copy retains complete original-file backups.
         replacements = []
         staged_inventory = dict(original)
+        movie_additions = []
+        for name, path in sorted(built.movie_files.items()):
+            destination = target/name
+            if destination.exists() or destination.is_symlink():
+                raise ExportError('movie_name_conflict', '测试副本已有同名影片，不覆盖原文件。')
+            staged = target/('.fvp-new-movie-' + secrets.token_hex(8))
+            with _safe(Path(path), file=True).open('rb') as incoming, staged.open('xb') as outgoing:
+                shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+            if _file_identity(staged) != movie_outputs[name]:
+                raise ExportError('candidate_changed', '影片暂存文件与生成结果不一致。')
+            staged_inventory[staged.name] = movie_outputs[name]
+            movie_additions.append((name, destination, staged, movie_outputs[name]))
         for name in [*sorted(built.archive_files),
                      *([built.target.executable] if paired_state else []),built.target.script]:
             destination = _safe(target / name, file=True)
@@ -1336,6 +1567,7 @@ class NativeSceneExporter:
             staged_inventory[backup.name], staged_inventory[staged.name] = original[name], output_identity
             replacements.append((name, destination, backup, staged, output_identity))
         script_backup = next(row[2] for row in replacements if row[0] == built.target.script)
+        checkpoint_result = {CHECKPOINT_FIELD: deepcopy(built.report[CHECKPOINT_FIELD])} if CHECKPOINT_FIELD in built.report else {}
         record = dict(schema=SCHEMA, scope=SCOPE, status="prepared", source_root=str(root),
             target_root=str(target), candidate_directory=str(folder), script=built.target.script,
             executable=built.target.executable, project_file=str(folder / "project.json"),
@@ -1345,7 +1577,9 @@ class NativeSceneExporter:
             source_script_sha256=sha(original_script), output_script_sha256=sha(built.payload),
             original_script_backup=str(script_backup), hook=built.report["hook"]["dialogue"],
             resource_archives=deepcopy(archives),
-            original_file_backups={name: str(backup) for name, _, backup, _, _ in replacements})
+            movie_imports=deepcopy(movie_imports),
+            original_file_backups={name: str(backup) for name, _, backup, _, _ in replacements},
+            **checkpoint_result)
         original_story_restore = dict(mode="native_state_pair" if paired_state else "legacy_restore_pending",
             connected=paired_state, runtime_verified=False, matching_test_executable_required=paired_state)
         record['original_story_restore'] = original_story_restore
@@ -1360,6 +1594,15 @@ class NativeSceneExporter:
             raise ExportError("copy_changed", "安装前新副本发生变化，备份和生成文件已保留。")
         update("installing", "正在把场景放入新副本…", output=partial)
         expected = dict(staged_inventory)
+        for name, destination, staged, identity in movie_additions:
+            protect()
+            if destination.exists() or destination.is_symlink() or _file_identity(staged) != identity:
+                raise ExportError('copy_changed', '安装期间影片位置或内容发生变化，已停止。')
+            # This installer requires Windows/robocopy. Windows rename rejects
+            # an existing destination, unlike replace: never clobber a movie.
+            os.rename(staged, destination)
+            expected.pop(staged.name)
+            expected[name] = identity
         for name, destination, backup, staged, identity in replacements:
             protect()
             if _file_identity(destination) != original[name] or _file_identity(staged) != identity:
@@ -1380,9 +1623,10 @@ class NativeSceneExporter:
             original_unchanged=True, runtime_verified=False, scope=SCOPE, standalone_startup=False,
             native_hook=record["hook"], original_script_backup=str(script_backup),
             resource_archives=list(built.archive_files),
+            imported_movies=list(built.movie_files),
             **(dict(native_state_test_copy=True,
                     original_executable_backup=record["original_executable_backup"])
-               if paired_state else {}), original_story_restore=original_story_restore)
+               if paired_state else {}), original_story_restore=original_story_restore, **checkpoint_result)
 
     def run(self, request, update):
         built = self.build(request, update)

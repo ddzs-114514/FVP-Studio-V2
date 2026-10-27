@@ -90,9 +90,40 @@ class GuiAudioBindings:
     def audio(self, event):
         return deepcopy(self.bindings[asset_key(event)])
 
+    def reserve_voice_replay_token(self):
+        # Replay tokens are script metadata, not archive filenames. Keep them
+        # above both original voice archives AND all newly allocated entries.
+        if getattr(self, 'voice_replay_next', None) is None:
+            self.frozen.check_unchanged()
+            maximum, found = 0, False
+            for name in ('voice.bin', 'voice2.bin'):
+                path = self.root / name
+                if not path.exists():
+                    continue
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError('原生人声素材包必须是登记目录内的普通文件。')
+                stamp = fingerprint(path)
+                _, high = _numeric_names(path)
+                if fingerprint(path) != stamp:
+                    raise GuiRuntimeError('source_changed', '分配回看编号时人声素材包发生变化。', 409)
+                self.frozen.references.append((path, stamp))
+                maximum, found = max(maximum, high), True
+            if not found:
+                raise ValueError('回看配音编号缺少目标人声素材包。')
+            maximum = max([maximum] + [b['native_id'] for b in self.bindings.values()
+                if b.get('kind') == 'voice' and type(b.get('native_id')) is int])
+            self.voice_replay_next, self.voice_replay_tokens = maximum + 1, []
+        token = self.voice_replay_next
+        if type(token) is not int or not 1 <= token <= 0x7fffffff:
+            raise ValueError('目标回看配音编号空间不足。')
+        self.voice_replay_next += 1
+        self.voice_replay_tokens.append(token)
+        return token
+
     def report(self):
         return dict(schema=SCHEMA, target="hoshi", original_entries_replaced=False,
-            pack_built=False, imports=[dict(kind=item["kind"], source=item["key"][0],
+            pack_built=False, voice_replay_tokens=list(getattr(self, 'voice_replay_tokens', [])),
+            imports=[dict(kind=item["kind"], source=item["key"][0],
                 source_archive=item["key"][1], source_resource=item["key"][2],
                 target_archive=name, target_resource=item["resource"], native_id=item["native_id"],
                 sha256=item["sha256"]) for name, group in self.groups.items() for item in group["items"]])

@@ -202,7 +202,7 @@ class _NativeDialogueGuard:
             raise ValueError('持续运动查询只支持已绑定的 R／XY 通道。')
         normalized = {c: tuple(tuple(row) for row in rows) for c, rows in by_channel.items()}
         cells = tuple(row for rows in normalized.values() for row in rows)
-        if (any(not rows or len(rows) > 4 for rows in normalized.values())
+        if (any(not rows or len(rows) > (8 if channel == 'xy' else 4) for channel, rows in normalized.items())
                 or any(len(r) != 2 for r in cells)
                 or any(type(g) is not int or not 0 <= g < 32768 for r in cells for g in r)
                 or len({g for r in cells for g in r}) != 2 * len(cells)):

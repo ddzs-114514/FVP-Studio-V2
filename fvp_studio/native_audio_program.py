@@ -15,7 +15,50 @@ KINDS = {'GuiBGM','GuiSE','GuiVoiceLine'}
 SCHEMA = 'fvp-native-audio-program/1'
 
 
+def audio_script_snapshot(native, reserve_private, *, extra_globals=()):
+    """Shared cache snapshot for both relative and absolute script emitters."""
+    ids=sorted(set(extra_globals).union(*(set(row['closure'].global_ids)
+                                        for row in native.bindings.values())))
+    header=native.source.header
+    total=header.non_volatile_globals+header.volatile_globals
+    if any(type(g) is not int or not 0 <= g < min(total,0x8000) for g in ids):
+        raise ValueError('原剧情音频快照超出本目标变量范围。')
+    private=(reserve_private(len(ids),'original_audio_script_state')['private_global_ids']
+             if ids else [])
+    if len(private)!=len(ids) or any(not total <= p <= 0x7fff for p in private):
+        raise ValueError('原剧情音频快照没有独立的私有变量。')
+    pairs=list(zip(ids,private))
+    return dict(snapshot=b''.join(_push_global(g)+_pop_global(p) for g,p in pairs),
+        restore=b''.join(_push_global(p)+_pop_global(g)+b'\x08'+_pop_global(p)
+                         for g,p in reversed(pairs)),
+        report=dict(global_ids=ids,private_global_ids=private,
+                    maximum_transient_operand_values=int(bool(ids)),
+                    private_cells_cleared_after_restore=True))
+
+
 class NativeAudioProgram:
+    @staticmethod
+    def capture_original_audio(target,owner,native,output):
+        """Capture before any authored stage initializer can call native code."""
+        previous=getattr(owner,'audio_resume_capture',None)
+        if previous is not None:
+            if previous['output'] is not output or previous['native'] is not native:
+                raise ValueError('音频原剧情快照不能跨编译复用。')
+            return previous
+        result=dict(output=output,native=native,binding=None,snapshot=None,blocker=None)
+        if getattr(target,'executable',None):
+            from .native_audio_resume import NativeAudioResumeBinding
+            try:
+                result['binding']=NativeAudioResumeBinding((target.root/target.executable).read_bytes())
+            except (ValueError,OSError,KeyError) as exc:
+                result['blocker']=str(exc)
+            else:
+                result['snapshot']=audio_script_snapshot(native,owner.snapshot_storage.reserve_private)
+                output.extend(result['snapshot']['snapshot'])
+                owner.native_audio_resume=result['binding']
+        owner.audio_resume_capture=result
+        return result
+
     def __init__(self, target, owner, events, output, bindings):
         if (owner is None or owner.target is not target or owner.snapshot_storage is None
                 or owner.snapshot_storage.handoff.source is not target.context.document
@@ -37,6 +80,12 @@ class NativeAudioProgram:
         self.native=bindings.native
         self.base=len(target.context.document.original_bytes)
         self.operations=[]
+        captured=self.capture_original_audio(target,owner,self.native,output)
+        self.resume,self.resume_snapshot=captured['binding'],captured['snapshot']
+        self.resume_blocker=captured['blocker']
+        self.resume_linked=False
+        self.backlog = self.voice_dialogue = self.voice_metadata_saved = None
+        self.backlog_blocker = None
         kinds=sorted({{'GuiBGM':'bgm','GuiSE':'se','GuiVoiceLine':'voice'}[e['kind']] for e in selected})
         if any(k not in self.native.bindings for k in kinds):
             raise ValueError('目标未绑定本场景使用的声音类型。')
@@ -51,6 +100,22 @@ class NativeAudioProgram:
             self.native.voice.bind_wait_guard(owner.guard, self.helpers['voice'])
         if any(e.get('fade_in_ms',0) for e in selected):
             self.helpers['bgm_fade']=self.native.prepare('bgm',output,fade_in=True)
+        if 'voice' in kinds:
+            from .native_voice_backlog import NativeVoiceBacklogProgram
+            try:
+                contract = self.native.voice.bind_backlog()
+            except ValueError as exc:
+                self.backlog_blocker = str(exc)
+            else:
+                # Never leave a half-emitted clone behind on a binding failure.
+                # Only unsupported CONTRACTS fall back to line-only playback.
+                self.voice_metadata_saved = owner.snapshot_storage.reserve_private(
+                    1, 'scene_voice_history_original')['private_global_ids'][0]
+                output.extend(_push_global(contract.voice_global)+_pop_global(self.voice_metadata_saved))
+                self.voice_dialogue = owner.dialogue.for_voice(self.native.voice, output)
+                self.backlog = NativeVoiceBacklogProgram(contract, output, bindings, selected)
+                for dialogue in (owner.dialogue, self.voice_dialogue):
+                    self.backlog.add_aliases(dialogue.mapping)
 
     def unless_equal(self, cell, value, body):
         """Runtime branch, so skipped routes never mutate audio ownership."""
@@ -105,15 +170,29 @@ class NativeAudioProgram:
         fields = voice_values({k:v for k,v in event.items() if k != 'kind'}, encoding=None)
         action = self.native.play(self.helpers['voice'], self.bindings.audio(event), volume=fields['volume'])
         self.operations.append(dict(event_kind='GuiVoiceLine', line_id=fields['line_id'],
-            op='line', native_wait=True, backlog_replay=False, **action.report))
-        # This runs after the native print initialization but before native
-        # wait. Do not forge an original voice-ID/backlog record for our path.
+            op='line', native_wait=True, backlog_replay=self.backlog is not None, **action.report))
+        # The scene-local printer skips the native numeric-file loader. The
+        # actual imported path starts after initialization and before waiting.
         return b'\x09'+_pop_global(self.flags['voice'])+action.code
 
-    def voice_end(self):
-        return self.native.stop('voice',0).code+b'\x08'+_pop_global(self.flags['voice'])
+    def claim_native_movie_bgm(self):
+        # Movie's byte-bound original wrapper performs AudioStop itself. Mark
+        # that category as used only on the executed route, without stopping
+        # it twice or leaving the "same authored BGM" cache stale afterwards.
+        if 'bgm' not in self.flags or self.resume is None or self.bgm_asset is None:
+            raise ValueError('影片没有配套的音乐通道所有权／原剧情续播接口。')
+        self.output.extend(b'\x09'+_pop_global(self.flags['bgm'])+b'\x08'+_pop_global(self.bgm_asset))
+        self.operations.append(dict(event_kind='GuiMovie', op='native_movie_bgm_stop',
+                                    executed_route_only=True, duplicate_audio_stop_emitted=False))
 
-    def finish(self):
+    def voice_before_print(self, event):
+        return self.backlog.before_print(event) if self.backlog else b''
+
+    def voice_end(self):
+        return (self.native.stop('voice',0).code+b'\x08'+_pop_global(self.flags['voice'])
+                +(self.backlog.clear_line() if self.backlog else b''))
+
+    def finish(self, *, restore_original=True):
         for kind,cell in self.flags.items():
             self.output.extend(_push_global(cell)+b'\x09\x22\x07')
             patch=len(self.output);self.output.extend(bytes(4))
@@ -123,12 +202,48 @@ class NativeAudioProgram:
         self.native.validate()
         if self.bgm_asset is not None:
             self.output.extend(b'\x08'+_pop_global(self.bgm_asset))
+        if self.backlog is not None:
+            self.output.extend(_push_global(self.voice_metadata_saved)
+                +_pop_global(self.backlog.contract.voice_global)
+                +b'\x08'+_pop_global(self.voice_metadata_saved))
+        if self.resume_snapshot is not None and restore_original:
+            # Pair with restoration of the retained native slot objects.
+            # Clearing these IDs instead would break the native same-track
+            # cache and the current/previous BGM channel selection on return.
+            self.output.extend(self.resume_snapshot['restore'])
+
+    def link_resume(self,bridge_report):
+        if self.resume is None:
+            return
+        bound=bridge_report.get('native_audio_resume',{})
+        if (bound.get('executable_sha256')!=self.resume.sha256
+                or not bound.get('original_playback_restore_connected')
+                or bound.get('native_registration_patch_count')!=len(self.resume.entries)):
+            raise ValueError('音频脚本快照缺少同一目标的原生声音恢复接口。')
+        self.resume_linked=True
 
     def report(self):
-        return dict(schema=SCHEMA,native=self.native.report(),operations=deepcopy(self.operations),
-            playback=playback_contract(self.flags),private_bgm_asset=self.bgm_asset,
+        native=self.native.report()
+        native['original_audio_restore_connected']=self.resume_linked
+        current = self.backlog.current if self.backlog else None
+        return dict(schema=SCHEMA,native=native,operations=deepcopy(self.operations),
+            playback=playback_contract(self.flags, voice_backlog_replay=bool(self.backlog and self.backlog.patches),
+                voice_current_line_replay=bool(current and current.patches)),
+            private_bgm_asset=self.bgm_asset,
             private_active_flags=deepcopy(self.flags),cleanup_only_executed_categories=True,
             scene_boundary_restarts_music=False,voice_connected='voice' in self.flags,
-            voice_backlog_replay=False,voice_stop_on_line_advance=True,
-            original_playback_restored=False,save_load_verified=False,
+            voice_backlog_replay=bool(self.backlog and self.backlog.patches),
+            voice_backlog=self.backlog.report() if self.backlog else None,
+            voice_backlog_blocker=self.backlog_blocker,
+            voice_current_line_replay=bool(current and current.patches),
+            voice_current_line=current.report() if current else None,
+            voice_current_line_blocker=self.backlog.contract.current_blocker if self.backlog else self.backlog_blocker,
+            voice_history_original_restored=self.voice_metadata_saved is not None,
+            voice_stop_on_line_advance=True,
+            original_playback_restored=False,
+            original_playback_restore_connected=self.resume_linked,
+            original_audio_resume=self.resume.report() if self.resume else None,
+            original_audio_resume_blocker=self.resume_blocker,
+            original_audio_globals=self.resume_snapshot['report']['global_ids'] if self.resume_snapshot else [],
+            save_load_verified=False,
             scene_export_connected=False,runtime_verified=False)

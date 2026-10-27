@@ -288,7 +288,8 @@ class NativeCGSceneThreadImage:
             raise ValueError("CG 回调重放无法接回它自己的原生指令位置。")
         return bytes(literal)+_jmp(target)
 
-    def assemble(self,payload,anchor,*,cleanup_sites=(),_defer_preserved_source_cycles=False):
+    def assemble(self,payload,anchor,*,cleanup_sites=(),_defer_preserved_source_cycles=False,
+                 voice_replay=None):
         if type(_defer_preserved_source_cycles) is not bool:
             raise ValueError('原作循环续作只能由本机隔离副本明确选择。')
         h,slots = self.handoff,self.slots
@@ -483,6 +484,15 @@ class NativeCGSceneThreadImage:
                 image[at:at+size] = raw
         if len(image) >= 2**31:
             raise ValueError("CG 整场景交接超出原生有符号地址范围。")
+        voice_patches = []
+        if voice_replay is not None:
+            from .native_voice_backlog import NativeVoiceBacklogProgram
+            if not isinstance(voice_replay, NativeVoiceBacklogProgram) or voice_replay.source is not h.source:
+                raise ValueError('回看配音程序不属于当前场景脚本。')
+            voice_patches = voice_replay.patch_image(image, function_maps=(
+                packet.report['callback_entries'],
+                graph_library.report['function_entries'] if graph_library is not None else {}))
+            source_patches.extend(p for p in voice_patches if p['offset'] < base)
         all_added = _decode(h,bytes(image[base:]),base,additional_globals)
         boundaries = ({i.offset for i in h.analysis.instructions}|{i.offset for i in h.source.instructions}
                       |{i.offset for i in all_added}|{i.offset for i in source_replay_items})
@@ -562,6 +572,7 @@ class NativeCGSceneThreadImage:
             resource_restore_native_frame_handoff_emitted=bool(restore_frame),
             original_callbacks_released_after_native_frame=bool(restore_frame),
             instruction_boundaries_checked=True,new_instruction_count=len(all_added),
+            native_voice_backlog=voice_replay.report() if voice_replay else None,
             original_global_ids_unchanged=True,private_flag_initialized_at_native_start=bool(h.roots),
             native_startup_frame_used_once=True,original_replay_kept=True,trampolines=trampolines,
             scene_return_preserver_entry=adapter,scene_return_preserved_in_one_argument_frame=True,

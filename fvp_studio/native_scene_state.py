@@ -118,22 +118,26 @@ class NativeSceneState:
         self.output.extend(self.snapshot['restore'])
         self.check_unchanged()
 
-    def prepare_threaded_scene_image(self, payload, anchor, *, _defer_preserved_source_cycles=False):
+    def prepare_threaded_scene_image(self, payload, anchor, *, _defer_preserved_source_cycles=False,
+                                     voice_replay=None):
         self.check_unchanged()
         image, report = NativeCGSceneThreadImage(self.thread_handoff, self.thread_slots,
             snapshot_storage=self.snapshot_storage, original_graph_journal=self.original_graph_journal).assemble(
             payload, anchor, cleanup_sites=self.thread_cleanups,
-            _defer_preserved_source_cycles=_defer_preserved_source_cycles)
+            _defer_preserved_source_cycles=_defer_preserved_source_cycles, voice_replay=voice_replay)
         self.thread_image_report = deepcopy(report)
         return image, report
 
-    def build_bridge(self, payload, thread_image):
+    def build_bridge(self, payload, thread_image, *, checkpoint_test=False):
         from .native_cg_state_bridge import build_state_bridge, link_state_bridge
+        from .gui_audio_checkpoint import bridge_options
+        checkpoint_options = bridge_options(checkpoint_test)
         self.check_unchanged()
         bridge = build_state_bridge((self.target.root / self.target.executable).read_bytes(),
             self.native_groups.report(), self.motion_binding.report(),
             thread_image['native_vm_syscall_catalogue'],
-            original_volatile_globals=self.analysis.header.volatile_globals)
+            original_volatile_globals=self.analysis.header.volatile_globals,
+            audio_resume=getattr(self,'native_audio_resume',None), **checkpoint_options)
         image, report = link_state_bridge(payload, thread_image, bridge, encoding=self.source.encoding)
         self.check_unchanged()
         return image, dict(executable=bridge.executable, report=report)

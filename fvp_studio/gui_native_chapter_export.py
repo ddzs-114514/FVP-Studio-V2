@@ -11,9 +11,10 @@ from .gui_native_scene_export import FEATURES, NativeSceneExporter
 from .gui_runtime import GuiRuntimeError
 from .gui_scene_export import ExportError, ExportJobs, export_snapshot, REQUEST_SCHEMA as SCENE_REQUEST
 from .gui_target_selection import FILE_OPTIONS
+from .gui_audio_checkpoint import REQUEST_FIELD as CHECKPOINT_FIELD
 from .native_scene_choice_tracks import KINDS as CHOICE_KINDS
 from .native_chapter_routes import EXIT_KIND
-from .gui_native_cg import KINDS as CG_KINDS
+from .gui_native_cg import KINDS as CG_KINDS, validate_opening_cg
 from .gui_chapter_transition import transition_values
 from .gui_story_logic import KINDS as LOGIC_KINDS, variables, route_targets, event_values as logic_values
 
@@ -44,7 +45,13 @@ def linear_plan(document, chapter_id):
 
 def native_chapter_plan(document, chapter_id):
     plan = chapter_plan(document, chapter_id)
-    if document["project"].get("source") == "hoshi":
+    scenes = [document['project']['scenes'][sid] for sid in plan['scene_ids']]
+    from .gui_native_feature_routing import needs_native_gestures_or_cg_transition
+    if document["project"].get("source") == "hoshi" and not any(
+            (isinstance(scene.get('setup'), dict) and scene['setup'].get('cg') is not None)
+            or any(isinstance(b, dict) and b.get('kind') == 'movie' for b in scene.get('beats', []))
+            or needs_native_gestures_or_cg_transition(scene)
+            for scene in scenes):
         raise ExportError("unsupported_target", "星空章节请沿用已有的章节输出入口。")
     # Keep the old compact straight-line form. Everything else gets explicit
     # labels, including backward edges; never unroll a user's cycle.
@@ -65,7 +72,7 @@ def native_chapter_snapshot(request):
         raise GuiRuntimeError("invalid_request", "通用章节请求必须为对象。")
     required = {"schema", "request_id", "chapter_id", "document"}
     if (request.get("schema") != REQUEST_SCHEMA or not required.issubset(request)
-            or set(request) - required - {"target_encoding", *FILE_OPTIONS}):
+            or set(request) - required - {"target_encoding", CHECKPOINT_FIELD, *FILE_OPTIONS}):
         raise GuiRuntimeError("invalid_request", "通用章节请求缺少内容或包含未允许的选项。")
     plan = native_chapter_plan(request["document"], request["chapter_id"])
     scene_request = {k: deepcopy(v) for k, v in request.items() if k not in {"schema", "chapter_id"}}
@@ -150,12 +157,15 @@ def validate_native_chapter_program(program):
     for n, (row, route) in enumerate(zip(rows, routes)):
         start, setup_end, exit_index = (row[k] for k in ("event_index", "setup_end", "exit_index"))
         after = rows[n+1]["event_index"] if n+1 < len(rows) else len(events)-1
-        if (not 0 < start+1 < setup_end < exit_index == after-1 < len(events)-1
+        movie_body = events[setup_end+1:exit_index]
+        empty_movie_setup = (start+1 == setup_end and bool(movie_body)
+                             and all(e['kind'] == 'GuiMovie' for e in movie_body))
+        if (not 0 < start+1 <= setup_end < exit_index == after-1 < len(events)-1
                 or events[start].get("scene_id") != row["scene_id"]
                 or not isinstance(route, dict) or route.get("scene_id") != row["scene_id"]
                 or events[exit_index] != dict(kind=EXIT_KIND, **route)
-                or events[start+1]["kind"] != "Background"
-                or any(e["kind"] not in {"Background", "Portrait"} for e in events[start+1:setup_end])
+                or (not empty_movie_setup and events[start+1]["kind"] != "Background")
+                or any(e["kind"] not in {"Background", "Portrait", "GuiCGSetup"} for e in events[start+1:setup_end])
                 or events[setup_end] != dict(kind="Transition", method="reveal", duration_ms=BOUNDARY_MS)):
             raise ExportError("invalid_native_chapter", "场景须在遮盖下布置、淡入，并通过自己的出口转移。")
         try:
@@ -166,6 +176,10 @@ def validate_native_chapter_program(program):
             raise ExportError("invalid_native_chapter", str(exc)) from exc
         if any(t not in ids for t in route_targets(route)):
             raise ExportError("invalid_native_chapter", "场景分支指向本次没有编译的入口。")
+    try:
+        validate_opening_cg(program, metadata)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ExportError("invalid_native_chapter", str(exc)) from exc
     visited = set()
     by_id = {r["scene_id"]: r for r in routes}
 
@@ -180,6 +194,11 @@ def validate_native_chapter_program(program):
     visit(ids[0])
     if visited != set(ids):
         raise ExportError("invalid_native_chapter", "场景分支不完整或含有未连接入口。")
+    from .gui_movie_program import movie_scene_ids
+    try:
+        movie_scene_ids(program,metadata)
+    except ValueError as exc:
+        raise ExportError('native_movie_scope',str(exc)) from exc
     return deepcopy(metadata)
 
 
@@ -197,6 +216,7 @@ class NativeChapterBuilder:
 
     def translate(self):
         events, rows, roots, swaps, motions, cg_groups = [], [], set(), [], [], []
+        stages, cg_lines, backgrounds, masks = [], [], [], []
         project = self.document["project"]
         black = dict(kind="Transition", method="black_out", duration_ms=BOUNDARY_MS)
         reveal = dict(kind="Transition", method="reveal", duration_ms=BOUNDARY_MS)
@@ -222,7 +242,7 @@ class NativeChapterBuilder:
             compiled.append((sid, builder, block))
         if self.has_errors:
             return None
-        rich_scenes = any(e["kind"] in CG_KINDS | CHOICE_KINDS
+        rich_scenes = any(e["kind"] in CG_KINDS | CHOICE_KINDS | {'GuiMovie'}
             for _, _, block in compiled for e in block["events"])
         routed = self.plan.get("requires_routes", False) or rich_scenes or any("transition" in r for r in self.plan["routes"])
         routes = {r["scene_id"]: deepcopy(r) for r in self.plan["routes"]}
@@ -270,16 +290,19 @@ class NativeChapterBuilder:
                     self.mapping.append({**deepcopy(mapping), "event_indexes": kept,
                         "chapter_id": self.plan["scene_chapters"][sid]})
             for name, destination in (("native_parallel_swaps", swaps), ("native_parallel_motion", motions),
-                    ("native_parallel_cg", cg_groups)):
+                    ("native_parallel_cg", cg_groups), ('native_parallel_stage', stages),
+                    ('native_cg_exit_lines', cg_lines), ('native_parallel_backgrounds', backgrounds),
+                    ('native_mask_transitions', masks)):
                 for group in block.get(name, []):
                     group = deepcopy(group)
                     group["beat_id"] = "chapter_"+checksum([sid, group["beat_id"]])[:48]
-                    for key in ("swap_index", "swap_indexes", "action_indexes"):
+                    for key in ("swap_index", "swap_indexes", "action_indexes", 'background_index', 'launch_index', 'complete_index',
+                            'prepare_index', 'transition_index'):
                         if key in group:
                             group[key] = ([remap[i] for i in group[key]] if isinstance(group[key], list)
                                 else remap[group[key]])
                     destination.append(group)
-            for name in ("backgrounds", "portraits", "cgs", "audios", "speakers"):
+            for name in ("backgrounds", "portraits", "cgs", "audios", "movies", "speakers"):
                 destination = getattr(self.resources, name)
                 for key, value in getattr(builder.resources, name).items():
                     if key in destination and destination[key] != value:
@@ -309,6 +332,14 @@ class NativeChapterBuilder:
             program["native_parallel_motion"] = motions
         if cg_groups:
             program['native_parallel_cg'] = cg_groups
+        if stages:
+            program['native_parallel_stage'] = stages
+        if cg_lines:
+            program['native_cg_exit_lines'] = cg_lines
+        if backgrounds:
+            program['native_parallel_backgrounds'] = backgrounds
+        if masks:
+            program['native_mask_transitions'] = masks
         validate_native_chapter_program(program)
         return program
 
@@ -342,7 +373,7 @@ class NativeChapterExportJobs(ExportJobs):
         result = dict(chapter_id=plan["chapter_id"], chapter_title=plan["title"],
             scene_ids=plan["scene_ids"], entry_scene_id=plan["entry_scene_id"],
             target_source=snapshot["document"]["project"]["source"])
-        for key in ("target_encoding", *FILE_OPTIONS):
+        for key in ("target_encoding", CHECKPOINT_FIELD, *FILE_OPTIONS):
             if key in snapshot:
                 result[key] = snapshot[key]
         return result

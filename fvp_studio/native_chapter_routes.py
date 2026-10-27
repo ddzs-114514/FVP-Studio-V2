@@ -17,7 +17,7 @@ EXIT_KIND = "GuiNativeChapterExit"
 
 class NativeChapterRoutes(NativeSceneChoiceTracks):
     def __init__(self, target, events, output, *, boundary_ms, subroutine_entries=False,
-                 menu_required=True, story_bank=None, **components):
+                 menu_required=True, story_bank=None, movie_handoff=None, **components):
         if menu_required:
             super().__init__(target, events, output,
                 scene_end_indexes={i for i, e in enumerate(events) if e["kind"] == EXIT_KIND},
@@ -49,12 +49,14 @@ class NativeChapterRoutes(NativeSceneChoiceTracks):
         self.local_scene_ended = False
         self.local_prompt_compiler = None
         self.story_bank = story_bank
+        self.movie_handoff = movie_handoff
 
     def call_setup(self, scene_id, transition):
         at = len(self.output)
         self.output.extend(b"\x02\0\0\0\0")
         self.setup_calls.append((at, scene_id))
-        self.screen.chapter_after(transition)
+        if not self.movie_handoff or not self.movie_handoff.enter_transition(scene_id,transition):
+            self.screen.chapter_after(transition)
         at = len(self.output)
         self.output.extend(b"\x06\0\0\0\0")
         self.transfers.append((at, scene_id))
@@ -93,9 +95,10 @@ class NativeChapterRoutes(NativeSceneChoiceTracks):
     def transfer(self, target, transition=None):
         self.join()
         transition = transition_values(transition if target is not None else None)
-        if self.subroutine_entries:
+        movie_exit = self.movie_handoff and self.current_scene in self.movie_handoff.movie_scenes
+        if self.subroutine_entries and not movie_exit:
             self.screen.chapter_before(transition)
-        else:
+        elif not self.subroutine_entries:
             self.screen.emit(dict(kind="Transition", method="black_out", duration_ms=self.boundary_ms))
         if self.cg is not None:
             self.cg.leave_scene()

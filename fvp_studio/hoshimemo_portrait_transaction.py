@@ -54,7 +54,7 @@ _TX_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SCENE_SCRIPT_SUFFIXES = frozenset({".hcb", ".bch"})
 _SCENE_RESOURCE_ARCHIVE_RE = re.compile(
-    r"^(?:graph|graph_bs|graph_bg|graph_vis(?:[0-9]+)?|bgm|bgm2|se)\.bin$",
+    r"^(?:graph|graph_bs|graph_bg|graph_vis(?:[0-9]+)?|bgm|bgm2|se|voice|voice2)\.bin$",
     re.IGNORECASE,
 )
 _RUNTIME_TEXT_COMPANION_NAMES = (
@@ -236,6 +236,9 @@ class ValidatedSceneOutput:
     resource_archive_files: Mapping[str, Path] = field(default_factory=dict)
     resource_archive_source_sha256: Mapping[str, str] = field(default_factory=dict)
     runtime_text_companion_files: Mapping[str, bytes] = field(default_factory=dict)
+    native_executable: bytes | None = None
+    native_executable_name: str | None = None
+    native_executable_source_sha256: str | None = None
     resource_archive_source_size: Mapping[str, int] = field(
         init=False,
         repr=False,
@@ -275,6 +278,28 @@ class ValidatedSceneOutput:
         output = validation.get("output") if isinstance(validation.get("output"), Mapping) else {}
         if str(output.get("hcb_sha256") or "").casefold() != _sha256_bytes(self.hcb):
             raise HoshimemoPortraitTransactionError("剧情候选字节哈希与报告不一致")
+        bridge=validation.get('native_audio_state_bridge')
+        if self.native_executable is None:
+            if (self.native_executable_name is not None or self.native_executable_source_sha256 is not None
+                    or isinstance(bridge,Mapping) and bridge.get('requires_matching_new_test_executable')):
+                raise HoshimemoPortraitTransactionError('配套原生接口缺少测试副本 EXE，不能只安装脚本。')
+        else:
+            name=_safe_filename(self.native_executable_name,'配套启动程序')
+            expected=_normalise_sha256(self.native_executable_source_sha256,'原始启动程序哈希')
+            if (not isinstance(self.native_executable,bytes) or not self.native_executable.startswith(b'MZ')
+                    or not name.lower().endswith('.exe') or not isinstance(bridge,Mapping)
+                    or bridge.get('source_executable_sha256')!=expected
+                    or bridge.get('output_executable_sha256')!=_sha256_bytes(self.native_executable)
+                    or bridge.get('output_script_sha256')!=_sha256_bytes(self.hcb)
+                    or bridge.get('script_linked') is not True
+                    or bridge.get('new_test_copy_only') is not True
+                    or bridge.get('requires_matching_new_test_executable') is not True
+                    or output.get('executable_name')!=name
+                    or output.get('executable_sha256')!=_sha256_bytes(self.native_executable)
+                    or validation.get('source',{}).get('executable_sha256')!=expected):
+                raise HoshimemoPortraitTransactionError('原生音频接口、脚本和启动程序不是同一配套候选。')
+            object.__setattr__(self,'native_executable_name',name)
+            object.__setattr__(self,'native_executable_source_sha256',expected)
         archives = dict(self.resource_archives)
         archive_files = dict(self.resource_archive_files)
         archive_sources = dict(self.resource_archive_source_sha256)
@@ -1298,6 +1323,15 @@ def prepare_scene_transaction(
         )
     if outputs.hcb == before:
         raise HoshimemoPortraitTransactionError("剧情候选 HCB 没有任何变化")
+    native_path=None
+    if outputs.native_executable is not None:
+        native_path=target.root / outputs.native_executable_name
+        if (target.active_source_root_authorized or native_path.is_symlink()
+                or native_path.resolve().parent!=target.root or not native_path.is_file()
+                or native_path.stat().st_nlink!=1):
+            raise HoshimemoPortraitTransactionError('配套原生接口只可安装到独立测试副本的直属 EXE。')
+        if _sha256_file(native_path)!=outputs.native_executable_source_sha256:
+            raise HoshimemoPortraitTransactionError('测试副本 EXE 与音频接口源哈希不一致。')
 
     archive_before: dict[str, dict[str, Any]] = {}
     archive_after: dict[str, dict[str, Any]] = {}
@@ -1379,9 +1413,14 @@ def prepare_scene_transaction(
                 "after": _fingerprint_dict(outputs.runtime_text_companion_files[name]),
             }
         )
+    if native_path is not None:
+        files.append(dict(kind='native_executable',executable_name=outputs.native_executable_name,
+            path=str(native_path),before=_fingerprint_file_dict(native_path),
+            after=_fingerprint_dict(outputs.native_executable)))
     commit_order = (
         [_scene_runtime_kind(name) for name in runtime_names]
         + [_scene_archive_kind(name) for name in archive_names]
+        + (['native_executable'] if native_path is not None else [])
         + ["hcb"]
     )
 
@@ -1413,7 +1452,8 @@ def prepare_scene_transaction(
             ),
             "source_fingerprint_matches_active_hcb": True,
             "candidate_validation_passed": True,
-            "hcb_only_transaction": not with_resources and not with_runtime_companion,
+            "hcb_only_transaction": not with_resources and not with_runtime_companion and native_path is None,
+            "matching_executable_before_script": native_path is not None,
             "graph_bs_and_hcb_transaction": set(archive_names) == {"graph_bs.bin"},
             "resource_archive_count": len(archive_names),
             "resource_archives_and_hcb_transaction": with_resources,
@@ -1447,6 +1487,8 @@ def install_scene_transaction(
     backup_root.mkdir(parents=True, exist_ok=False)
     manifest_path = backup_root / SCENE_TRANSACTION_MANIFEST
     output_by_kind: dict[str, bytes] = {"hcb": outputs.hcb}
+    if outputs.native_executable is not None:
+        output_by_kind['native_executable']=outputs.native_executable
     for name, payload in outputs.resource_archives.items():
         output_by_kind[_scene_archive_kind(name)] = payload
     for name, payload in outputs.runtime_text_companion_files.items():
@@ -1499,6 +1541,8 @@ def install_scene_transaction(
                 records[kind]["archive_name"] = dry_by_kind[kind]["archive_name"]
             if "runtime_name" in dry_by_kind[kind]:
                 records[kind]["runtime_name"] = dry_by_kind[kind]["runtime_name"]
+            if 'executable_name' in dry_by_kind[kind]:
+                records[kind]['executable_name']=dry_by_kind[kind]['executable_name']
 
         manifest: dict[str, Any] = {
             "schema": SCENE_TRANSACTION_SCHEMA,
@@ -1649,7 +1693,7 @@ def inspect_scene_transaction(manifest_path: Path) -> dict[str, Any]:
         archive_name = _scene_kind_archive_name(kind)
         runtime_name = _scene_kind_runtime_name(kind)
         if (
-            (kind != "hcb" and archive_name is None and runtime_name is None)
+            (kind not in ("hcb","native_executable") and archive_name is None and runtime_name is None)
             or kind in kinds
         ):
             raise HoshimemoPortraitTransactionError(
@@ -1683,6 +1727,10 @@ def inspect_scene_transaction(manifest_path: Path) -> dict[str, Any]:
                 raise HoshimemoPortraitTransactionError(
                     f"剧情事务资源归档名称与文件类型不一致: {kind}"
                 )
+        if kind=='native_executable':
+            name=_safe_filename(record.get('executable_name'),'配套启动程序')
+            if not name.lower().endswith('.exe') or destination.name!=name or not before_exists:
+                raise HoshimemoPortraitTransactionError('剧情事务的配套 EXE 记录不一致。')
         if runtime_name is not None:
             recorded_runtime = str(record.get("runtime_name") or runtime_name)
             if (
@@ -1757,7 +1805,7 @@ def inspect_scene_transaction(manifest_path: Path) -> dict[str, Any]:
     archive_kinds = sorted(
         kind for kind in kinds - {"hcb"} if _scene_kind_archive_name(kind) is not None
     )
-    expected_order = runtime_kinds + archive_kinds + ["hcb"]
+    expected_order = runtime_kinds + archive_kinds + (['native_executable'] if 'native_executable' in kinds else []) + ["hcb"]
     if commit_order != expected_order:
         raise HoshimemoPortraitTransactionError(
             "剧情事务提交顺序必须是运行时组件、资源归档在前，HCB 在后"

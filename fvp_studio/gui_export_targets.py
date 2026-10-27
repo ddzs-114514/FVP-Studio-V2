@@ -32,8 +32,8 @@ from .gui_target_selection import select_source, entry_choices, validate_options
 SCHEMA = "fvp-gui-export-target/1"
 
 
-def _sway_axis_capability(target, counts, axis):
-    from .gui_actor_sway import START, STOP
+def _sway_axis_capability(target, counts, axis, *, nod=False):
+    from .gui_actor_sway import START, STOP, NOD
     from .native_portrait_sway import NativePortraitSway
     from .native_portrait_dialogue import NativePortraitDialogue
     if not counts:
@@ -44,16 +44,29 @@ def _sway_axis_capability(target, counts, axis):
     state.bind_camera(None)
     events = []
     for actor in range(1, max(counts) + 1):
+        if nod:
+            events.append(dict(kind=NOD, actor=actor, amplitude=24, duration_ms=450, curve=3))
+            continue
         fields = dict(actor=actor, loop_id='probe_' + str(actor))
         events.extend([dict(kind=START, **fields, axis=axis, amplitude=1, direction=1, period_ms=1600, curve=3),
                        dict(kind=STOP, **fields)])
     rotation = NativeRotationDegrees(target) if axis == 'r' else None
     sway = NativePortraitSway(target, state, events, code, rotation)
     sway.stop_binding.validate(sway.stop_channels, state.primitives)
+    if nod:
+        assignments = allocate_native_slots(state.catalog.slots, ['nod_probe_' + str(i) for i in range(max(counts))])
+        for slot in assignments.values():
+            pair = slot.evidence['dispatcher_handles']['primitive_ids']
+            if len(pair) != 2 or len(set(pair)) != 2:
+                raise ValueError('点头需要两套已绑定的角色缓冲。')
     # Bind the same per-line native query graph, not only a syscall-name list.
     NativePortraitDialogue(target.context, {}, code, cg_guard=state.guard)
-    return dict(supported=True, max_actors=max(counts),
+    result = dict(supported=True, max_actors=max(counts),
         native_thread_slots=sorted({r['slot'] for r in sway.rows.values()}), runtime_verified=False)
+    if nod:
+        result.update(script_units_supported=True, script_y_factor=sway.motion.xy_factors['y'],
+            original_timing_supported=sway.table.get('V3DMotionTest', (None, None))[1] == 0)
+    return result
 
 
 def _sway_capability(target, counts):
@@ -107,7 +120,17 @@ def _parallel_stage_capability(target, report):
     names = {context.analysis_document.header.syscalls[i.operands['id']].name
         for address in closure.dependencies for i in spans[address].instructions if i.mnemonic=='syscall'}
     camera = bool(report['camera']['supported'] and not names.intersection({'V3DSet','V3DMotion','V3DMotionStop'}))
-    fade = slide = False
+    fade = slide = expression = False
+    if 'native_expression_blend' in report.get('allowed_features', []) and max(report['portrait']['supported_actor_counts'], default=0)>1:
+        try:
+            inventory = _return_inventory(spans,set(closure.dependencies),set())
+            for address in closure.dependencies:
+                for position,item in enumerate(spans[address].instructions):
+                    if (item.mnemonic=='syscall' and context.analysis_document.header.syscalls[item.operands['id']].name == 'PartsMotion'):
+                        _return_unused(spans,spans[address],position,inventory)
+            expression = True
+        except ValueError:
+            pass
     if max(report['portrait']['supported_actor_counts'],default=0)>1:
         try:
             inventory = _return_inventory(spans,set(closure.dependencies),set())
@@ -126,9 +149,13 @@ def _parallel_stage_capability(target, report):
                 slide = True
         except ValueError:
             pass
-    return dict(supported=camera or bool(report['background_blur']['supported']) or fade,
+    return dict(supported=camera or bool(report['background_blur']['supported']) or fade or expression
+            or bool(report.get('screen_transition', {}).get('portraits_compatible')),
         camera=camera,background_blur=bool(report['background_blur']['supported']),
         other_actor_fade=fade,same_actor_alpha=False,other_actor_slide=slide,
+        other_actor_expression=expression, slide_with_geometry=slide,
+        screen_transition=bool(report.get('screen_transition', {}).get('portraits_compatible')),
+        background_change=bool(report.get('screen_transition', {}).get('portraits_compatible')),
         native_apply_frontier=True,native_state_pair_required=True,runtime_verified=False)
 
 
@@ -148,8 +175,8 @@ class NativeExportTargetCatalog:
 
     def info(self, source_id, **options):
         registered = self.runtime._source(source_id)
-        if source_id == "hoshi":
-            raise GuiRuntimeError("invalid_request", "星空沿用现有的独立测试副本输出。")
+        # Capability discovery is read-only for every registered target.
+        # Ordinary legacy exports keep their routing; OP uses these bindings.
         options = validate_options(options)
         source = select_source(registered, options)
         cache_key = (source_id, tuple(sorted(options.items())))
@@ -185,6 +212,11 @@ class NativeExportTargetCatalog:
             audio=dict(schema='fvp-native-audio-capability/1',supported=False,kinds=[],voice=False,
                 local_choice_branches=False,original_playback_restore=False,
                 paired_native_state_required=True,runtime_verified=False),
+            movie=dict(schema='fvp-native-movie-capability/1',supported=False,
+                standalone_op_scene_only=True,chapter_mainline=False,mixed_beats=False,
+                sequential_movie_beats=False,
+                same_target_files_only=True,registered_source_import=False,external_transcoding=False,
+                runtime_verified=False),
             portrait=dict(supported=False, capacity=0, expression_default_ms=200,
                 body_swap_blend=False, body_swap_duration_control=False,
                 body_swap_alpha_fusion=dict(supported=False,duration_policy='max',
@@ -194,10 +226,15 @@ class NativeExportTargetCatalog:
                     other_loaded_actors=False,xy_with_scale_or_depth=False,
                     native_state_pair_required=True,runtime_verified=False),
                 body_swap_parallel_stage=dict(supported=False,camera=False,background_blur=False,
-                    other_actor_fade=False,same_actor_alpha=False,other_actor_slide=False),
+                    other_actor_fade=False,same_actor_alpha=False,other_actor_slide=False,
+                    other_actor_expression=False,slide_with_geometry=False,screen_transition=False,background_change=False),
                 parallel_motion=dict(supported=False, channels=[], multiple_actors=False,
-                    xy_with_scale_or_depth=False, native_state_pair_required=True, runtime_verified=False),
+                    xy_with_scale_or_depth=False, companion_channels=[],
+                    native_state_pair_required=True, runtime_verified=False),
                 instant_body_swap_proven=False, sway=dict(supported=False)),
+            same_beat=dict(supported=False, actions=[], transition_methods=[], cg_exit_with_line=False,
+                background_change_with_actions=False, background_change_with_blur=False,
+                target_info_required=True, native_state_pair_required=True, runtime_verified=False),
             encoding_confirmed=False, runtime_verified=False, probe_is_read_only=True,
             writes_game_files=False, standalone_startup=False, chapter_export=False,
             limitations=["测试场景插在原作某句台词前，保留原作开头；不是启动后直接进入测试场景。",
@@ -253,6 +290,22 @@ class NativeExportTargetCatalog:
         except (ValueError, KeyError) as exc:
             screen = None
             report["screen_transition"]["message"] = str(exc)
+        # Ordinary scenes and CG use the same target-owned catalog. Do not
+        # make ordinary masks depend on whether that target supports CG.
+        masks, mask_message = None, None
+        if screen is not None:
+            try:
+                from .native_transition_masks import NativeTransitionMasks
+                masks = NativeTransitionMasks(screen, backend, target.root)
+                masks.prepare(bytearray(), nonblocking=True)
+                report['screen_transition']['methods'].append('mask')
+                report['screen_transition'].update(mask_dissolve_supported=True,
+                    masks=sorted(masks.items), mask_catalog_endpoint='chapter-transition-catalog',
+                    masks_require_target_catalog=True, mask_names_are_not_directions=True,
+                    mask_owns_background_reveal=True)
+            except (AttributeError, TypeError, ValueError, KeyError, OSError) as exc:
+                masks, mask_message = None, str(exc)
+                report['screen_transition'].update(masks=[], mask_message=mask_message)
         record = target.discovery.get("profile_seed", {}).get("native_symbols", {}).get("portrait_dispatcher")
         try:
             menu = bind_scene_menu(context)
@@ -377,6 +430,14 @@ class NativeExportTargetCatalog:
             except (ValueError, KeyError):
                 report["portrait"]["message"] = "此版本的立绘加载、站位或独立角色槽尚未接通。"
         if report["portrait"]["supported"]:
+            from .gui_actor_nod import contract as nod_contract
+            report['portrait']['nod'] = nod_contract()
+            try:
+                report['portrait']['nod'].update(_sway_axis_capability(
+                    target, report['portrait']['supported_actor_counts'], 'y', nod=True))
+                report['allowed_features'].append('portrait_nod')
+            except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
+                report['portrait']['nod'].update(supported=False, message=str(exc))
             try:
                 report['portrait']['sway'] = _sway_capability(target, report['portrait']['supported_actor_counts'])
                 if report['portrait']['sway']['supported']:
@@ -389,6 +450,10 @@ class NativeExportTargetCatalog:
                 report['portrait']['parallel_motion'] = dict(supported=True,
                     channels=parallel['channels'], multiple_actors=parallel['other_loaded_actors'],
                     xy_with_scale_or_depth=parallel['xy_with_scale_or_depth'],
+                    companion_channels=(
+                        (['parts'] if 'native_expression_blend' in report['allowed_features'] else [])
+                        + (['alpha'] if 'alpha' in report['native_motion_channels'] else [])
+                        if parallel['xy_with_scale_or_depth'] else []),
                     native_state_pair_required=True, runtime_verified=False)
                 if parallel['xy_with_scale_or_depth']:
                     report['allowed_features'].append('native_portrait_parallel_motion')
@@ -422,6 +487,18 @@ class NativeExportTargetCatalog:
                     background_retained=camera is not None,
                     shared_background_slot=cg.ownership["background_reload_required"],
                     support_confirmed_on_export=True)
+                from .gui_native_cg import opening_setup_contract
+                report["cg"]["opening_setup"] = opening_setup_contract()
+                from .gui_cg_transition import contract as cg_transition_contract
+                report['cg']['transitions'] = cg_transition_contract()
+                report['cg']['transitions'].update(supported=True,
+                    methods=['cut', 'black', 'white', 'dissolve', 'black_out', 'white_out', 'reveal'],
+                    masks=[])
+                if masks is not None:
+                    report['cg']['transitions']['methods'].append('mask')
+                    report['cg']['transitions']['masks'] = sorted(masks.items)
+                else:
+                    report['cg']['transitions']['mask_message'] = mask_message or '此目标尚无已绑定的原作遮罩。'
                 from .gui_cg_stage_handoff import contract as cg_exit_setup_contract, pose_capability
                 setup = cg_exit_setup_contract()
                 actions = ["bg"]
@@ -468,6 +545,27 @@ class NativeExportTargetCatalog:
             try:
                 NativeSceneState(target)
                 paired_audio_state = True
+                from .native_parallel_beat import contract as parallel_contract
+                parallel = parallel_contract()
+                actions = []
+                if report['portrait']['supported']:
+                    actions = [name for name, channel in (('move','xy'),('scale','s2'),('depth','z'),
+                        ('tilt','r'),('fade','alpha')) if channel in report['native_motion_channels']
+                        and (name != 'tilt' or report['rotation_degrees_supported'])]
+                    if 'native_expression_blend' in report['allowed_features']:
+                        actions.append('expr')
+                    actions += ['enter','exit']
+                if report['camera']['supported']:
+                    actions.append('camera')
+                if report['background_blur']['supported']:
+                    actions.append('bgblur')
+                parallel.update(supported=bool(actions), actions=actions,
+                    transition_methods=list(report['screen_transition']['methods']),
+                    cg_exit_with_line=bool(report['cg']['supported']),
+                    background_change_with_actions=bool(actions),
+                    background_change_with_blur=bool(report['background_blur']['supported']),
+                    portrait_transition_counts=report['screen_transition'].get('supported_actor_counts', []))
+                report['same_beat'] = parallel
                 from .gui_chapter_transition import contract
                 report.update(chapter_export=True, chapter_transitions=contract())
                 report["chapter"] = dict(supported=True, exit_modes=["next", "jump", "condition", "end"]
@@ -494,21 +592,69 @@ class NativeExportTargetCatalog:
             if kinds:
                 if not paired_audio_state:
                     NativeSceneState(target)
+                voice_history, voice_history_message = None, None
+                if 'voice' in kinds:
+                    try:
+                        voice_history = audio.voice.bind_backlog()
+                    except ValueError as exc:
+                        voice_history_message = str(exc)
                 report['audio'].update(supported=True,kinds=kinds,
                     native=audio.report(),chapter_mainline=True,
-                    voice='voice' in kinds,voice_backlog_replay=False,
+                    voice='voice' in kinds,voice_backlog_replay=voice_history is not None,
+                    voice_backlog=voice_history.report() if voice_history else None,
+                    voice_backlog_message=voice_history_message,
+                    voice_current_line_replay=bool(voice_history and voice_history.current),
+                    voice_current_line=voice_history.current.report() if voice_history and voice_history.current else None,
+                    voice_current_line_message=voice_history.current_blocker if voice_history else voice_history_message,
                     local_choice_branches=report['choices']['supported'],support_confirmed_on_export=True)
                 from .gui_audio_program import playback_contract
-                report['audio']['playback'] = playback_contract(kinds)
+                report['audio']['playback'] = playback_contract(kinds, voice_backlog_replay=voice_history is not None,
+                    voice_current_line_replay=bool(voice_history and voice_history.current))
+                from .native_audio_resume import NativeAudioResumeBinding
+                try:
+                    resume=NativeAudioResumeBinding((target.root/target.executable).read_bytes())
+                except (ValueError,KeyError,OSError) as exc:
+                    report['audio']['original_playback_restore_message']=str(exc)
+                else:
+                    report['audio'].update(original_playback_restore=True,
+                        original_audio_resume=resume.report(),original_playback_restore_runtime_verified=False)
                 report['allowed_features'].extend('audio_'+kind for kind in kinds)
                 if report.get('chapter',{}).get('supported'):
                     # The legacy boolean means all audio, including voice.
                     report['chapter']['audio_kinds']=kinds
                     report['chapter']['audio']={'bgm','se','voice'} <= set(kinds)
-                report['limitations'].append('声音结束时清理实际使用的类型；原剧情播放位置恢复、人声回看重播未接入。场内分支只执行选中路线的声音，音乐／音效汇合后续播。')
+                report['limitations'].append('声音按实际执行的原生槽隔离，结束后接回原剧情播放位置；配套测试副本的实机听感与存读档待验收。'
+                    if report['audio']['original_playback_restore'] else
+                    '此目标尚未匹配原剧情音频断点续播；场内分支只执行选中路线的声音，结束时清理使用过的类型。')
+                if 'voice' in kinds:
+                    report['limitations'].append('原生回看配音已匹配，实际回放与存读档尚待实机验收。'
+                        if voice_history else '此目标的原生回看配音尚未匹配：'+str(voice_history_message))
             else:
                 report['audio'].update(native=audio.report(),message='当前目标尚无可用的音乐／音效绑定与资源包。')
         except (ValueError, KeyError, OSError) as exc:
             report['audio']['message'] = str(exc)
+        if report['audio']['supported'] and report['audio']['original_playback_restore']:
+            try:
+                from .native_movie import NativeMovieBinding
+                movie = NativeMovieBinding(context)
+                movie.assert_audio(audio)
+                if screen is None:
+                    raise ValueError('此目标的 OP 安全转场助手尚未匹配。')
+                movie.screen_sites(screen)
+                report['movie'].update(supported=True, native=movie.report(),
+                    endpoint='scene-export', beat_kind='movie',
+                    chapter_mainline=True, chapter_endpoint='native-chapter-export',
+                    chapter_single_movie_beat=False, sequential_movie_beats=True,
+                    same_target_files_only=False, registered_source_import=True,
+                    target_native_extensions=movie.suffixes, decoder_compatibility_verified=False,
+                    sequence_transition='first_entry_last_exit', between_movies='cut', skippable_per_movie=True,
+                    movie_exit_choices=False,
+                    movie_exit_conditions=False, transition_handoff='native_ready_and_before_stop',
+                    skippable=True, waits_for_native_end=True,
+                    duration_is_preview_estimate=True, support_confirmed_on_export=True)
+                report['allowed_features'].append('movie_standalone_op')
+                report['allowed_features'].append('movie_chapter_op')
+            except (ValueError, KeyError, OSError) as exc:
+                report['movie']['message'] = str(exc)
         target.check_unchanged()
         return report

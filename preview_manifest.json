@@ -1,25 +1,30 @@
 {
   "schema": "fvp-gui-public-preview/1",
-  "date": "2026-10-22",
+  "date": "2026-10-28",
   "backend_included": true,
   "upload_ready": true,
   "package_scope": "gui_and_early_backend",
   "repository_visibility": "public",
   "license": "GPL-3.0-or-later",
   "backend_publication_audit_complete": true,
-  "backend_version": "0.2.2",
-  "release_input_sha256": "d63af0e8966b3197f34134f9076a01f4b122e4d40e492e0f6a79778c8aeb5c3a",
-  "release_input_digest_scope": "sorted relative-path to SHA256 map: selected source modules, formal GUI and public backend status",
+  "backend_version": "0.2.3",
+  "release_input_sha256": "26fa980e25a322eb5699daaa7d82186bd061135148c2a6cdac45159036075956",
+  "release_input_digest_scope": "sorted relative-path to SHA256 map of frozen selected development Python modules",
   "validation": {
-    "focused_tests_passed": 94,
-    "call_table_tests_passed": 8,
+    "focused_tests_passed": 30,
     "portable_tests_passed": 26,
     "portable_tests_skipped": 1,
+    "release_boundary_tests_passed": 3,
     "gui_model_checks": "passed",
+    "original_game_files_read": false,
     "original_game_files_written": false,
     "runtime_verified": false
   },
-  "requires_private_configuration": ["sources", "engine_recognition_signatures", "hoshi_connection_for_hoshi_export"],
+  "requires_private_configuration": [
+    "sources",
+    "engine_recognition_signatures",
+    "hoshi_connection_for_hoshi_export"
+  ],
   "source_gui_sha256": "1b1b3dccf3f2988f72ea54dd7d4ede7acce50f735f0bd1538bbbb4fbfa54c905",
   "preview_gui_sha256": "91a5c09bf7ac0f64150f5ab89b4fe48b81f72692464536351b4a9e14c22c03e4",
   "css_unchanged": true,
@@ -38,8 +43,16 @@
     "sync_formal_GUI_and_completed_mainline_dependency_closure",
     "extend_lazy_hash_gated_private_engine_bindings",
     "preserve_portable_launcher_and_new_only_workspace_guards",
-    "include_read_only_original_call_table_tool_without_original_data"
+    "include_read_only_original_call_table_tool_without_original_data",
+    "completed_stage_mask_cg_nod_parallel_backend_contracts",
+    "shared_voice_replay_and_registered_movie_backend_dependencies",
+    "exclude_unfinished_audio_checkpoint_and_reject_explicit_requests",
+    "digest_based_same_module_private_pattern_collection"
   ],
   "test_games_included": false,
-  "full_FVP_feature_coverage": false
+  "full_FVP_feature_coverage": false,
+  "gui_updated": false,
+  "gui_unchanged_since": "2026-10-22",
+  "new_frontend_connections_complete": false,
+  "unfinished_audio_checkpoint_implementation_included": false
 }

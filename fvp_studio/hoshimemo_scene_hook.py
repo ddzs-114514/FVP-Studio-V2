@@ -2203,6 +2203,7 @@ def _compile_inserted_dialogue(
     *,
     analysis_document: HcbDocument | None = None,
     after_print_bytes: bytes = b"",
+    before_print_bytes: bytes = b"",
     before_line_bytes: Mapping[str, bytes] | None = None,
     after_print_bytes_by_line: Mapping[str, bytes] | None = None,
 ) -> tuple[bytes, list[dict[str, Any]]]:
@@ -2231,7 +2232,7 @@ def _compile_inserted_dialogue(
         source_document=document,
     )
     speaker_catalog = discover_story_speakers(document, profile)
-    if not isinstance(after_print_bytes, bytes):
+    if not isinstance(after_print_bytes, bytes) or not isinstance(before_print_bytes, bytes):
         raise HoshimemoSceneHookError("台词初始化后的立绘重应用程序必须是 bytes")
     line_ids = [
         str(line.get("line_id") or f"line-{index}")
@@ -2360,6 +2361,9 @@ def _compile_inserted_dialogue(
             if voice_id is not None:
                 raise HoshimemoSceneHookError(f"新增台词 {index} 的旁白不能绑定角色语音")
             speaker_name = "旁白"
+        # Imported native voice metadata must follow SPEAK initialization and
+        # precede the target's own HistorySet/threaded text recorder.
+        output.extend(before_print_bytes)
         dialogue_payload, text_emission = _push_dialogue_string(
             text,
             document.encoding,

@@ -35,6 +35,8 @@ from .performance_workflow import digest
 from .gui_cg_imports import GuiCgImports
 from .bin_archive import append_hzc_entries
 from .gui_target_selection import FILE_OPTIONS, validate_entry_name
+from .gui_audio_checkpoint import (REQUEST_FIELD as CHECKPOINT_FIELD,
+    enabled as checkpoint_enabled, require_audio_program, attach_report as attach_checkpoint_report)
 
 REQUEST_SCHEMA = "fvp-gui-scene-export-request/1"
 JOB_SCHEMA = "fvp-gui-scene-export-job/1"
@@ -64,8 +66,9 @@ def export_snapshot(request):
     try:
         object_only(request, "请求")
         required = {"schema", "request_id", "scene_id", "document"}
-        if not required.issubset(request) or set(request) - required - {"target_encoding", *FILE_OPTIONS}:
+        if not required.issubset(request) or set(request) - required - {"target_encoding", CHECKPOINT_FIELD, *FILE_OPTIONS}:
             raise ValueError("生成请求缺少内容或包含未允许的选项")
+        checkpoint_enabled(request)
         if request["schema"] != REQUEST_SCHEMA:
             raise ValueError("生成请求格式不支持")
         ident(request["request_id"], "请求 ID")
@@ -117,9 +120,16 @@ def new_target(target, source, parent):
 
 
 def validate_bytes(source, clean, payload, emitter):
+    session=getattr(emitter,'audio_resume_session',None)
+    extended_header=None
+    if session is not None:
+        payload,extended_header=session.validation_parts(payload)
     prefix = bytearray(payload[:len(source)])
     prefix[ENTRY:ENTRY + 5] = ENTRY_BYTES
     emitter.native_speakers.validate_patches(payload, prefix)
+    voice_replay = getattr(emitter, 'legacy_voice_replay', None)
+    if voice_replay is not None:
+        voice_replay.validate_patches(payload, prefix)
     bank = getattr(emitter, "story_bank", None)
     if bank is not None:
         from .gui_story_program import StoryVariableBank
@@ -131,7 +141,8 @@ def validate_bytes(source, clean, payload, emitter):
         raise ExportError("invalid_candidate", "场景生成失败：游戏入口或原始脚本发生了意外变化。")
     append = payload[len(source):]
     table = struct.unpack_from("<I", clean)[0]
-    decoded = parse_bytes(struct.pack("<I", 4 + len(append)) + append + clean[table:], encoding="gbk")
+    decoded = parse_bytes(struct.pack("<I", 4 + len(append)) + append
+                          + (extended_header if extended_header is not None else clean[table:]), encoding="gbk")
     bounds = {len(source) + ins.offset - 4 for ins in decoded.instructions} | set(emitter.by_offset)
     if decoded.warnings or any(ins.opcode in (2, 6, 7) and ins.operands["target"] not in bounds
                                for ins in decoded.instructions):
@@ -275,8 +286,10 @@ class SceneExporter:
                 else GuiCgEmitter(source, clean))
 
     def build(self, request, update):
+        checkpoint_test = checkpoint_enabled(request)
         program, builder, metadata = self.prepare(request)
         self.validate(program)
+        require_audio_program(checkpoint_test, program['events'])
         root = _safe(Path(program["source_root"]))
         if root != _safe(self.runtime._source("hoshi").root):
             raise ExportError("unsupported_target", "场景目标不是已登记的游戏来源。")
@@ -288,7 +301,11 @@ class SceneExporter:
         update("compiling", "正在生成" + self.label + "…")
         resources = ExportResources(root, builder.resources)
         emitter = self.make_emitter(source, clean, program)
+        if hasattr(emitter,'bind_audio_resume'):
+            emitter.bind_audio_resume(exe, **(dict(checkpoint_test=True) if checkpoint_test else {}))
         payload = emitter.compile(program, resources)
+        if hasattr(emitter,'finalize_audio_resume'):
+            payload=emitter.finalize_audio_resume(payload)
         archives = resources.finish()
         count = validate_bytes(source, clean, payload, emitter)
         resources.check_unchanged()
@@ -304,7 +321,7 @@ class SceneExporter:
             output=dict(hcb_sha256=sha(payload), resource_archives=output_archives),
             required_exe_sha256=EXE_SHA, source_fingerprints=stamps,
             original_prefix_unchanged_outside_entry=getattr(emitter, "story_bank", None) is None and not emitter.native_speakers.patches,
-            original_code_unchanged_outside_entry=not emitter.native_speakers.patches, instruction_boundaries_checked=True,
+            original_code_unchanged_outside_entry=not emitter.native_speakers.patches and getattr(emitter, 'legacy_voice_replay', None) is None, instruction_boundaries_checked=True,
             new_instruction_count=count, events=emitter.events, resource_reports=resources.packs.reports,
             native_motion_contract=emitter.stage_motion.report(),
             native_stage_helpers=emitter.stage_helpers.report(),
@@ -323,6 +340,15 @@ class SceneExporter:
             report["story_state"] = emitter.story_bank.report()
         if getattr(emitter, 'legacy_audio_program', None) is not None:
             report['audio_program'] = emitter.legacy_audio_program.report()
+        if getattr(emitter, 'legacy_voice_replay', None) is not None:
+            report['voice_replay'] = emitter.legacy_voice_replay.report()
+        audio_session=getattr(emitter,'audio_resume_session',None)
+        attach_checkpoint_report(report, checkpoint_test, audio_session.report() if audio_session else None)
+        if audio_session is not None:
+            report['native_audio_state_bridge']=audio_session.report()
+            report['source']['executable_sha256']=EXE_SHA
+            report['output']['executable_sha256']=sha(audio_session.bridge.executable)
+            report['output']['executable_name']='Hoshimemo_HD.exe'
         folder = self.output_root / (self.family + "-" + digest(program)[:12] + "-" + secrets.token_hex(8))
         folder.mkdir(exist_ok=False)
         update("publishing", "正在保存生成文件…", output=dict(candidate_directory=str(folder)))
@@ -342,6 +368,9 @@ class SceneExporter:
         resources.check_unchanged()
         with (folder / "candidate.hcb").open("xb") as stream:
             stream.write(payload)
+        if audio_session is not None:
+            with (folder / 'candidate.exe').open('xb') as stream:
+                stream.write(audio_session.bridge.executable)
         changed = {**audio_files, **cg_files}
         for name, data in archives.items():
             if output_archives[name]["sha256"] != source_archives[name]["sha256"]:
@@ -355,7 +384,10 @@ class SceneExporter:
         outputs = ValidatedSceneOutput(hcb=payload, source_sha256=SOURCE_SHA,
             plan_sha256=digest(program), emitter_id=self.emitter_id, profile_id=PROFILE, validation=report,
             resource_archive_files=changed,
-            resource_archive_source_sha256={n: source_archives[n]["sha256"] for n in changed})
+            resource_archive_source_sha256={n: source_archives[n]["sha256"] for n in changed},
+            native_executable=audio_session.bridge.executable if audio_session else None,
+            native_executable_name='Hoshimemo_HD.exe' if audio_session else None,
+            native_executable_source_sha256=EXE_SHA if audio_session else None)
         return folder, outputs, program, report, resources, [i for i in builder.issues if i["level"] in ("warn", "warning")]
 
     def install(self, folder, outputs, program, report, resources, update):
@@ -396,6 +428,8 @@ class SceneExporter:
 
         required = sum(item["size"] for item in original.values()) + sum(
             p.stat().st_size for p in outputs.resource_archive_files.values()) * 2 + 4 * 1024**3
+        if outputs.native_executable is not None:
+            required += len(outputs.native_executable)*2
         if shutil.disk_usage(self.test_parent).free < required:
             raise ExportError("disk_full", "测试盘空间不足；生成文件已保留。")
         protect()
@@ -434,26 +468,41 @@ class SceneExporter:
         for name in outputs.resource_archive_files:
             if _fingerprint(target / name, independent=True)["sha256"] != report["output"]["resource_archives"][name]["sha256"]:
                 raise ExportError("install_failed", "新副本的场景素材不完整，已保留目录供检查。")
+        if outputs.native_executable is not None:
+            if _fingerprint(target / outputs.native_executable_name, independent=True)['sha256'] != report['output']['executable_sha256']:
+                raise ExportError('install_failed','新副本的音频接口与场景脚本不配套。')
         project_file = folder / "project.json"
         selection = {k: deepcopy(report[k]) for k in ("chapter_id", "chapter_title", "entry_scene_id", "scene_ids",
                                                     "chapter_sha256", "routes") if k in report}
+        checkpoint_result = {CHECKPOINT_FIELD: deepcopy(report[CHECKPOINT_FIELD])} if CHECKPOINT_FIELD in report else {}
         record = dict(schema=self.install_schema, scope=self.scope, **selection,
             original_unchanged=True, old_test_scripts_unchanged=True, runtime_verified=False,
             source_root=str(source), target_root=str(target), candidate_directory=str(folder),
             project_file=str(project_file), scene_id=report["scene_id"],
             document_sha256=report["document_sha256"], plan_sha256=report["plan_sha256"],
             copy_file_count=len(copied), copy_bytes=sum(v["size"] for v in copied.values()),
-            copy_all_sha256_equal=True, copy_all_files_single_link=True, transaction=transaction)
+            copy_all_sha256_equal=True, copy_all_files_single_link=True, transaction=transaction,
+            **checkpoint_result)
+        if outputs.native_executable is not None:
+            record['native_audio_state_bridge']=deepcopy(report['native_audio_state_bridge'])
         with (folder / "installation.json").open("x", encoding="utf-8") as stream:
             json.dump(record, stream, ensure_ascii=False, indent=2)
         return dict(test_directory=str(target), candidate_directory=str(folder),
             project_file=str(project_file), game_executable=str(target / "Hoshimemo_HD.exe"),
-            original_unchanged=True, runtime_verified=False, scope=self.scope, **selection)
+            original_unchanged=True, runtime_verified=False, scope=self.scope,
+            original_audio_resume_connected=outputs.native_executable is not None, **selection, **checkpoint_result)
 
     def run(self, request, update):
-        if request["document"]["project"]["source"] != "hoshi":
+        project = request['document']['project']
+        scene = project['scenes'][request['scene_id']]
+        beats = scene.get('beats')
+        has_movie = isinstance(beats, list) and any(isinstance(b, dict) and b.get('kind') == 'movie' for b in beats)
+        has_opening_cg = isinstance(scene.get('setup'), dict) and scene['setup'].get('cg') is not None
+        from .gui_native_feature_routing import needs_native_gestures_or_cg_transition
+        if project['source'] != 'hoshi' or has_movie or has_opening_cg or needs_native_gestures_or_cg_transition(scene):
             if self.scope != SCOPE:
-                raise ExportError("unsupported_target", "其他游戏目前只接当前场景输出，章节输出尚未接通。")
+                raise ExportError("unsupported_target", "影片请使用独立 OP 场景输出；章节影片尚未接通。" if has_movie
+                                  else "其他游戏目前只接当前场景输出，章节输出尚未接通。")
             from .gui_native_scene_export import NativeSceneExporter
             return NativeSceneExporter(self.runtime, self.output_root,
                 test_parent=self.test_parent).run(request, update)
@@ -489,7 +538,7 @@ class ExportJobs:
         # current source. This is metadata only; browser paths remain forbidden.
         result = dict(scene_id=snapshot["scene_id"], scene_title=scene["title"],
                       target_source=snapshot["document"]["project"]["source"])
-        for key in ("target_encoding", *FILE_OPTIONS):
+        for key in ("target_encoding", CHECKPOINT_FIELD, *FILE_OPTIONS):
             if key in snapshot:
                 result[key] = snapshot[key]
         return result

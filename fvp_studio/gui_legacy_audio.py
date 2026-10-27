@@ -1,7 +1,8 @@
 """Reuse target-bound BGM/SE semantics in the fingerprinted legacy exporter.
 
 Only candidate-owned tail globals are added. Original game files and the
-legacy voice/text bridge are untouched; decoder-position restore is separate.
+legacy voice/text bridge are retained; native audio retention is shared with
+generic exports whenever the emitter supplies a matched executable.
 """
 from functools import lru_cache
 from types import SimpleNamespace
@@ -46,6 +47,15 @@ class LegacyAudioProgram(NativeAudioProgram):
             raise ValueError('旧输出目标未绑定所需声音类型。')
         self.output, self.bindings, self.base = emitter.output, resources, 0
         self.operations = []
+        # The adapter owns no alternate audio-resume implementation. It uses
+        # the same target-bound session as the generic paired export.
+        self.backlog=self.voice_dialogue=self.voice_metadata_saved=None
+        self.backlog_blocker=None
+        session=getattr(emitter,'audio_resume_session',None)
+        self.resume=session.binding if session else None
+        self.resume_snapshot=session.snapshot if session else None
+        self.resume_blocker=None if session else '此编译调用未提供配套原生音频状态接口。'
+        self.resume_linked=False
         bank = getattr(emitter, 'story_bank', None)
         if bank is None:
             bank = emitter.story_bank = StoryVariableBank(emitter, {})

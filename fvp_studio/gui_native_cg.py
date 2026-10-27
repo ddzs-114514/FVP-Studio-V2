@@ -27,7 +27,14 @@ from .gui_choice_tracks import (SCHEMA as TRACK_SCHEMA, KINDS as TRACK_KINDS,
 
 SCHEMA = "fvp-gui-preflight-program/2"
 CONTRACT = "fvp-gui-cg-preflight/1"
-KINDS = {"GuiCGLoad", "GuiCGTransform", "GuiCGExit"}
+KINDS = {"GuiCGSetup", "GuiCGLoad", "GuiCGTransform", "GuiCGExit"}
+
+
+def opening_setup_contract():
+    return dict(schema="fvp-native-opening-cg/1", field="setup.cg", duration_ms=0,
+        target_info_required=True, paired_native_state_required=True,
+        background_required=True, at_start_portraits=False,
+        source_exit_owns_transition=True, runtime_verified=False)
 
 
 @lru_cache(maxsize=1)
@@ -57,14 +64,32 @@ def number(value, low, high, *, integral=False):
 
 def event_values(kind, fields):
     """Closed, independent types; no production node/schema is added."""
-    if kind == "GuiCGLoad":
+    if 'transition' in fields:
+        from .gui_cg_transition import values as transition_values
+        if kind not in {'GuiCGLoad', 'GuiCGExit', 'GuiCGTransform'}:
+            raise ValueError('只有 CG 加载、退场或构图可附带转场。')
+        transition = transition_values(fields['transition'])
+        plain = {k: v for k, v in fields.items() if k != 'transition'}
+        if kind != 'GuiCGTransform':
+            if type(plain.get('duration_ms')) is not int or plain['duration_ms'] != transition['duration_ms']:
+                raise ValueError('CG 切换由所选转场统一控制时长。')
+            # Validate the remaining legacy fields without inventing a second
+            # fade. A direct cut's true zero survives in the returned event.
+            event_values(kind, dict(plain, duration_ms=600))
+        else:
+            event_values(kind, plain)
+        return deepcopy(dict(plain, transition=transition))
+    if kind in {"GuiCGSetup", "GuiCGLoad"}:
         allowed = {"source_game", "archive", "resource", "fit", "duration_ms"}
         if set(fields) != allowed or fields["fit"] != "contain":
             raise ValueError("CG 原生预检仅支持完整单帧 contain 登记")
         for key in ("source_game", "archive", "resource"):
             if not isinstance(fields[key], str) or not fields[key] or len(fields[key]) > 1024 or "\0" in fields[key]:
                 raise ValueError("CG 来源/资源引用不合法")
-        number(fields["duration_ms"], 100, 3000, integral=True)
+        if kind == "GuiCGSetup":
+            number(fields["duration_ms"], 0, 0, integral=True)
+        else:
+            number(fields["duration_ms"], 100, 3000, integral=True)
     elif kind == "GuiCGTransform":
         if set(fields) != {"x", "y", "s", "duration_ms", "curve"}:
             raise ValueError("CG 构图字段不完整或包含未知字段")
@@ -81,6 +106,33 @@ def event_values(kind, fields):
     else:
         raise ValueError("未知 CG 扩展事件")
     return deepcopy(fields)
+
+
+def validate_opening_cg(program, chapter=None):
+    """Opening pictures belong to setup, never to a beat or choice branch."""
+    events = program["events"]
+    indexes = [i for i, event in enumerate(events) if event.get("kind") == "GuiCGSetup"]
+    if not indexes:
+        return
+    if chapter is None:
+        if indexes != [2] or [e["kind"] for e in events[:2]] != ["Scene", "Background"]:
+            raise ValueError("开场 CG 只能紧接场景的开场背景，不能放进台词或选项分支。")
+    else:
+        # Chapter metadata has already been structurally validated by its
+        # owner. Only routed setup subroutines can own an opening CG.
+        allowed = set()
+        for row in chapter["scenes"]:
+            start, end = row["event_index"] + 1, row["setup_end"]
+            own = [i for i in indexes if start <= i < end]
+            if own:
+                if ("exit_index" not in row or own != [start + 1]
+                        or [e["kind"] for e in events[start:end]] != ["Background", "GuiCGSetup"]):
+                    raise ValueError("开场 CG 须在本场景背景之后、转场揭幕之前单独布置。")
+                allowed.update(own)
+        if allowed != set(indexes):
+            raise ValueError("开场 CG 不在对应场景的开场布置范围内。")
+    for index in indexes:
+        event_values("GuiCGSetup", {k: v for k, v in events[index].items() if k != "kind"})
 
 
 def validate_gui_program(program):
@@ -309,7 +361,11 @@ class GuiCgEmitter(Emitter):
             self.output.extend(args([value]) + b"\x15" + struct.pack("<H", glob))
 
     def emit_extension(self, event, resources):
+        if event.get('transition') is not None:
+            raise ValueError('CG 组合转场须使用目标绑定的通用导出。')
         kind = event["kind"]
+        if kind == "GuiCGSetup":
+            raise ValueError("开场 CG 须使用目标绑定的通用导出，不支持旧固定 ABI 入口。")
         if kind == "Speech":
             return self.native_speakers.speech(event, resources)
         if emit_background(self, event, resources):

@@ -256,7 +256,7 @@ class NativeCGThreadSlots:
                 code.extend(b"\x03"+struct.pack("<H",ident)+b"\x14\x05")
                 struct.pack_into("<I",code,branch,base+len(code))
             if name == "ThreadExit":
-                code.extend(b'\x10\xfe\x08"\x07\x00\x00\x00\x00')
+                code.extend(b"\x10\xfe\x08\x22\x07\0\0\0\0")
                 branch = len(code)-4
                 code.extend(b"\x08\x03"+struct.pack("<H",ident)+b"\x14\x05")
                 struct.pack_into("<I",code,branch,base+len(code))

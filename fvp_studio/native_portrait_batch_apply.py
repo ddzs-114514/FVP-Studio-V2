@@ -153,6 +153,8 @@ class NativePortraitBatchApply:
             extra_names = {'MotionMoveStop'}
             if getattr(extra_motion,'alpha_ids',()):
                 extra_names.update({'MotionAlpha','MotionAlphaStop'})
+            if getattr(extra_motion,'parts_ids',()):
+                extra_names.add('PartsMotion')
             for original in self.closure.dependencies:
                 span = self.spans[original]
                 for position,item in enumerate(span.instructions):
@@ -394,7 +396,7 @@ class NativePortraitBatchApply:
                     protected = self.extra_motion.protected_primitives(name)
                 elif name in {'MotionMove','MotionMoveZ','MotionMoveStop'}:
                     protected = self.extra_motion.primitive_ids
-            if protected and name in {'MotionMove','MotionMoveZ','MotionMoveStop','MotionAlpha','MotionAlphaStop'}:
+            if protected and name in {'MotionMove','MotionMoveZ','MotionMoveStop','MotionAlpha','MotionAlphaStop','PartsMotion'}:
                 owned = b''.join(native_args[0]+_arguments([p])+b'\x22'+(b'\x21' if i else b'')
                     for i,p in enumerate(protected))
                 code.extend(_push_global(self.extra_motion.kicked_global)+b'\x09\x22'+owned+b'\x20\x07\0\0\0\0')

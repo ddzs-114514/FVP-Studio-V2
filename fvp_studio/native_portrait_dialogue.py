@@ -55,7 +55,8 @@ def _translated_literal_stub(source, analysis, item, actual):
 
 class NativePortraitDialogue:
     def __init__(self, context, lifecycle, output, *, roots=None,
-                 suppress_scope="owned_scene_dialogue_only", cg_guard=None):
+                 suppress_scope="owned_scene_dialogue_only", cg_guard=None, voice=None):
+        self.context, self.lifecycle, self.suppress_scope = context, lifecycle, suppress_scope
         source, analysis = context.document, context.analysis_document
         pair_binding = validate_native_script_pair(source, analysis, runtime_context=context)
         guard_prefix = "cg"
@@ -79,6 +80,14 @@ class NativePortraitDialogue:
         records = [lifecycle.get("clear"), lifecycle.get("apply")]
         records.extend(lifecycle.get("delegates", {}).values())
         suppressed = {int(s["start"]) for s in records if s}
+        if voice is not None:
+            from .native_voice import NativeVoiceBackend
+            if (not isinstance(voice, NativeVoiceBackend) or voice.audio.context is not context
+                    or roots != {voice.dialogue_abi.print_target, voice.dialogue_abi.wait_target}
+                    or suppress_scope != 'owned_scene_dialogue_only'):
+                raise NativePortraitAcceptanceError('配音台词克隆没有绑定同一目标的打印与等待入口。')
+            voice.binding['closure'].compile_snapshot(source)
+            suppressed.add(voice.binding['span'].start)
         if (not suppressed and cg_guard is None) or any(s not in spans for s in suppressed | roots):
             raise NativePortraitAcceptanceError("台词舞台交接缺少原生函数身份。")
         # Include explicitly marked native ThreadStart function pointers. They
@@ -244,6 +253,7 @@ class NativePortraitDialogue:
             motion_join_inserted_before_text=False, suppress_scope=suppress_scope,
             native_entry_roots=sorted(roots),
             native_portrait_targets=sorted(selected),
+            imported_voice_loader_suppressed=voice.binding['span'].start if voice is not None else None,
             **{f"{guard_prefix}_handle_guard": cg_guard.report() if cg_guard is not None else None,
                f"{guard_prefix}_guarded_syscall_sites": guarded_records,
                f"{guard_prefix}_guard_entries": deepcopy(guard_entries),
@@ -276,6 +286,11 @@ class NativePortraitDialogue:
             if item.mnemonic == "call" and item.operands["target"] in self.mapping:
                 struct.pack_into("<I", output, item.offset - 4 + 1, self.entry_mapping[item.operands["target"]])
         return bytes(output)
+
+    def for_voice(self, voice, output):
+        return NativePortraitDialogue(self.context, self.lifecycle, output,
+            roots={voice.dialogue_abi.print_target, voice.dialogue_abi.wait_target},
+            suppress_scope=self.suppress_scope, cg_guard=self.cg_guard, voice=voice)
 
     def report(self):
         return deepcopy(self._report)

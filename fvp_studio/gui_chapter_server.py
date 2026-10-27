@@ -35,6 +35,8 @@ class ChapterRuntime(AudioRuntime):
             original_game_read_only=True, launch_game=False, runtime_verified=False)
         from .gui_chapter_transition import contract
         result["chapter_export_contract"]["transitions"] = contract()
+        result['chapter_export_contract']['original_audio_resume']=dict(
+            result['scene_export_contract']['original_audio_resume'])
         result["story_logic_contract"] = dict(schema=STORY_CONTRACT, target="hoshi",
             project_field="variables", beat_field="effects", choice_option_field="effects",
             variable_types=["bool", "int"], max_variables=MAX_VARIABLES,

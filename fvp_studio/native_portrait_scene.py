@@ -112,7 +112,9 @@ class NativePortraitScene:
         motion_channels = set()
         for event in events:
             if event['kind'] in SWAY_KINDS:
-                if event['kind'] == 'GuiActorSwayStart':
+                if event['kind'] == 'GuiActorNod':
+                    motion_channels.add('xy')
+                elif event['kind'] == 'GuiActorSwayStart':
                     motion_channels.add('xy' if event.get('axis', 'r') == 'y' else 'r')
             elif event["kind"] in {"GuiActorMove", "GuiActorSlide"}:
                 motion_channels.add("xy")
@@ -341,12 +343,22 @@ class NativePortraitScene:
                 / (old['z']-self.geometry.camera[2]) * 720 / self.geometry.viewport[1])
         return portrait,old,same_origin
 
-    def swap_batch(self,events,*,parallel_events=None,stage_events=None,blur=None):
+    def swap_batch(self,events,*,parallel_events=None,stage_events=None,blur=None,screen=None,background_launch=None):
         if self.snapshot_storage is None or not isinstance(events,(tuple,list)) or not 1 <= len(events) <= 4:
             raise ValueError('同拍换装需要已配对的原生状态接口和真实已加载的角色。')
         actors = [e['portrait']['actor'] for e in events]
         if len(set(actors))!=len(actors):
             raise ValueError('同一批换装不能重复同一个演员。')
+        slides = [e for e in stage_events or [] if e['kind'] == 'GuiActorSlide']
+        if slides:
+            if any(e['actor'] in actors for e in slides):
+                raise ValueError('换装角色的滑动必须走自身两缓冲合并路径。')
+            for event in slides:
+                self.join(event['actor'])
+            normalized = self.prepare_slides(slides)
+            parallel_events = list(parallel_events or []) + [e for e in normalized if e['kind'] == 'GuiActorMove']
+            stage_events = [e for e in stage_events if e['kind'] != 'GuiActorSlide'] + [
+                e for e in normalized if e['kind'] == 'Action']
         extra_events = [e for e in parallel_events or [] if e.get('actor') not in actors]
         extra_actors = sorted({e.get('actor') for e in extra_events})
         for actor in extra_actors:
@@ -367,9 +379,10 @@ class NativePortraitScene:
                 _batch_prepare=True))
         extra_motion, extra_updates = self.prepare_extra_motion(extra_events) if extra_events else (None,{})
         stage_effects = None
-        if stage_events:
+        if stage_events or background_launch is not None:
             from .native_scene_parallel_effects import NativeSceneParallelEffects
-            stage_effects = NativeSceneParallelEffects(self,stage_events,blur=blur,motion=extra_motion)
+            stage_effects = NativeSceneParallelEffects(self,stage_events or [],blur=blur,motion=extra_motion,
+                screen=screen,background_launch=background_launch)
             extra_motion = stage_effects
             if self.scene_camera is not None and (any(
                     min(row['old_fields']['z'], row['new_fields']['z'],
@@ -399,6 +412,13 @@ class NativePortraitScene:
             self.states[actor].update(updates)
             for channel in channels:
                 self.pending[actor,channel]=True
+        if any(e['kind'] == 'Transition' for e in stage_events or ()):
+            screen.finish_parallel()
+            self.join()
+            if self.scene_camera:
+                self.scene_camera.join()
+            if blur:
+                blur.join()
 
     def prepare_extra_motion(self,events):
         from .native_scene_parallel_motion import NativeSceneParallelMotion
@@ -419,19 +439,64 @@ class NativePortraitScene:
             updates[actor]=(end,channels)
         return NativeSceneParallelMotion(self.loader,self.motion,rows,self.snapshot_storage),updates
 
+    def prepare_slides(self, events):
+        """Resolve slide XY/alpha before the shared launch, preserving scale/pivot."""
+        prepared = []
+        for event in events:
+            if event['kind'] != 'GuiActorSlide':
+                prepared.append(event)
+                continue
+            actor = event['actor']
+            state = self.states.get(actor)
+            if state is None or event.get('phase') not in {'enter', 'exit'} or event.get('direction') not in {'left', 'right'}:
+                raise ValueError('滑入滑出需要已准备的角色和明确方向。')
+            off = -event['height'] * .3 if event['direction'] == 'left' else 1280 + event['height'] * .3
+            if not -640 <= off <= 1920:
+                raise ValueError('滑动起止位置超出场景范围。')
+            if event['phase'] == 'enter':
+                if state['alpha'] != 0:
+                    raise ValueError('滑入须以不可见角色准备，不能把在场角色瞬移到画外。')
+                nx, ny = self.geometry.native_xy(state, off, event['y'])
+                self.output.extend(self.syscall('PrimSetXY', [self.prim(actor), self.push(nx), self.push(ny)]))
+                state.update(x=nx, y=ny, stage_x=off, bottom_y=event['y'])
+            fields = dict(actor=actor, duration_ms=event['duration_ms'], curve=event['curve'])
+            prepared.append(dict(kind='GuiActorMove', **fields,
+                x=event['x'] if event['phase'] == 'enter' else off, y=event['y']))
+            prepared.append(dict(kind='Action', **fields, channels='alpha', alpha=255 if event['phase'] == 'enter' else 0))
+        return prepared
+
     def motion_batch(self, events):
         """Launch current-buffer trajectories once, before any new wait."""
         from .hoshimemo_scene_hook import _call
-        from .native_portrait_motion_group import bind_motion_groups
+        from .native_portrait_motion_group import bind_motion_groups, split_motion_events
         bind_motion_groups(events, [dict(beat_id='current', action_indexes=list(range(len(events))))])
+        geometry, companions = split_motion_events(events)
         actors = sorted({event['actor'] for event in events})
         if self.snapshot_storage is None or any(actor not in self.states for actor in actors):
             raise ValueError('普通同拍运动需要本目标配对状态接口和已经入场的角色。')
+        # Validate every companion before appending waits or launching any of
+        # this beat. A parts-only/alpha-only actor is still an owned live slot.
+        for event in companions:
+            actor, channel = event['actor'], event['channels']
+            duration = event.get('duration_ms')
+            if type(duration) is not int or not 0 <= duration <= 6000:
+                raise ValueError('同拍表情／透明度的原生时长无效。')
+            if channel == 'alpha':
+                if self.alpha is None:
+                    raise ValueError('同拍透明度尚未绑定本目标的原生参数。')
+                self.alpha.compile(self.prim(actor), self.states[actor]['alpha'],
+                    event.get('alpha'), duration)
+            else:
+                loaded = self.loader._active.get(self.actors[actor])
+                frame = event.get('expression')
+                if (loaded is None or type(frame) is not int
+                        or not 0 <= frame < loaded['frames']):
+                    raise ValueError('同拍表情须属于该角色当前身体的有效帧。')
         # Join prior tracks only. None of the new group's channels have been
         # launched yet; never wait for XY before starting its S2/Z companion.
         for actor in actors:
             self.join(actor)
-        motion, updates = self.prepare_extra_motion(events)
+        motion, updates = self.prepare_extra_motion(geometry)
         start = len(self.source.original_bytes) + len(self.output)
         plan = motion.prepare(self.source, start + 5)
         self.output.extend(b'\x06' + struct.pack('<I', start + 5 + len(plan.code)))
@@ -442,11 +507,19 @@ class NativePortraitScene:
             self.motion_groups = []
         self.motion_groups.append(dict(native_launch=plan.report(),
             launch_boundary='all_current_buffers_before_first_new_wait',
+            companion_channels=[event['channels'] for event in companions],
+            companion_actor_ids=sorted({event['actor'] for event in companions}),
             source_size_rule_changed=False, scene_export_connected=True, runtime_verified=False))
         for actor, (end, channels) in updates.items():
             self.states[actor].update(end)
             for channel in channels:
                 self.pending[actor, channel] = True
+        # All previous tracks were joined above. These proven nonblocking
+        # alpha/parts paths cannot wait for the newly launched XY/S2/Z tracks.
+        # Keep their own durations; the subsequent authored Wait/Text owns
+        # completion, exactly as for independent normal actor actions.
+        for event in companions:
+            self.emit(event)
 
     def prepare_parallel_motion(self, actor, fields, events, *, base_scale=None, _resolve_only=False):
         """Target-native two-buffer trajectories; never move a new body twice."""

@@ -115,7 +115,7 @@ class ReleaseTests(unittest.TestCase):
                 data = bytes.fromhex(node.args[0].value)
             if data is not None:
                 approved[f"toy:{node.lineno}:{node.col_offset}"] = hashlib.sha256(data).hexdigest()
-        with mock.patch.object(prepare_local, "APPROVED", approved), mock.patch.object(ep, "APPROVED", approved):
+        with mock.patch.object(prepare_local, "APPROVED", approved), mock.patch.object(prepare_local, "ACTIVE", list(approved)), mock.patch.object(ep, "APPROVED", approved):
             result = prepare_local.collect_patterns(reader)
             self.assertEqual(set(result["patterns"]), set(approved))
 

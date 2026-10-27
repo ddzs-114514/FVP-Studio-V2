@@ -188,10 +188,14 @@ def chapter_plan(document, chapter_id):
 
 
 def chapter_snapshot(request):
+    from .gui_audio_checkpoint import REQUEST_FIELD, enabled
     try:
         object_only(request, "请求")
-        if set(request) != {"schema", "request_id", "chapter_id", "document"} or request["schema"] != REQUEST_SCHEMA:
+        required = {"schema", "request_id", "chapter_id", "document"}
+        if (not required.issubset(request) or set(request) - required - {REQUEST_FIELD}
+                or request["schema"] != REQUEST_SCHEMA):
             raise ValueError("章节生成请求不正确。")
+        enabled(request)
         ident(request["request_id"], "请求 ID")
         if len(canonical(request)) > MAX_BYTES:
             raise GuiRuntimeError("request_too_large", "工程超过 16 MiB。", 413)

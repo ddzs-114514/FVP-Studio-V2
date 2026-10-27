@@ -1,8 +1,8 @@
 """Caller-bound dialogue voice, with native mute/skip and input waiting.
 
 Only a proven dialogue loader is eligible, never a system-voice/SE helper
-selected merely by a filename. Current scope is line playback, not backlog
-replay or restoration of an inherited decoder's playback position.
+selected merely by a filename. Native history replay is independently bound
+on demand; inherited decoder playback-position restoration is not implied.
 """
 from copy import deepcopy
 import hashlib
@@ -95,6 +95,21 @@ class NativeVoiceBackend:
         row['closure'] = NativeScriptStateClosure(audio.source, audio.analysis,
             [row['span'].start], runtime_context=context)
         self.printer, self.wait_sites = printer.start, sorted(sites)
+        self._backlog = None
+        self._backlog_checked = False
+        self._backlog_blocker = None
+
+    def bind_backlog(self):
+        if not self._backlog_checked:
+            from .native_voice_backlog import NativeVoiceBacklog
+            try:
+                self._backlog = NativeVoiceBacklog(self)
+            except ValueError as exc:
+                self._backlog_blocker = str(exc)
+            self._backlog_checked = True
+        if self._backlog is None:
+            raise ValueError(self._backlog_blocker)
+        return self._backlog
 
     def _bind(self, span, normal):
         audio = self.audio
@@ -232,5 +247,6 @@ class NativeVoiceBackend:
             loader_argument_count=self.binding['span'].args,print_wait_split=deepcopy(self.print_split),
             channel_global=self.binding['channel_global'],wait_audio_state_sites=deepcopy(self.wait_sites),
             native_mute_skip_guards=True,explicit_target_path=True,game_name_switch_used=False,
-            native_click_auto_wait_preserved=True,backlog_replay=False,
+            native_click_auto_wait_preserved=True,backlog_replay=self._backlog is not None,
+            backlog_binding_checked=self._backlog_checked,backlog_blocker=self._backlog_blocker,
             original_playback_restored=False,runtime_verified=False)

@@ -5,4 +5,4 @@ writes HCB files while preserving unknown bytes, so the editor can be used as a
 safe analysis tool before game-specific profiles are added.
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"

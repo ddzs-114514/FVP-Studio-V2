@@ -1,6 +1,26 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Identity digests only; private instruction signatures are not distributed.
-APPROVED = {'native_cg_global_storage:20:8': 'd63c646ededa9ddb2a48e0741c5b7a1259ef3b608144874218ce2a4997bf18a4',
+# Identity digests only; no private instruction signatures.
+APPROVED = {'native_audio_resume:106:17': '1390e00af2a1106ed23be74f039feb98a6a4237bb3157b3a8dbddf096f55eca7',
+ 'native_audio_resume:128:33': '50746ef40efbb6489b3a4623453fad598818c109d4acbf0c370cd80eb3ea570d',
+ 'native_audio_resume:130:40': '80021e0d305e7193903e4833ea8b2a4dc2ad0f327db8d694462782f068d23167',
+ 'native_audio_resume:132:18': 'fd3937b1adcb0ac04626c2ac91ffe574c7322dedb22a6f66e1d2c6ec91c937b1',
+ 'native_audio_resume:146:44': 'b3af138aa97b17f0feb1b7dc6d0c9cbd214456295af8f75aa1d743305af708b7',
+ 'native_audio_resume:148:29': 'ab960930fe94b6ebb21021993d4b3dec77c33236230014fa1b86111d56598579',
+ 'native_audio_resume:151:43': 'b9d6b5d9a3bb268152d8746c44c267d0e5f2eba362bcbe00d3b22dc0b4252bae',
+ 'native_audio_resume:154:11': '960d894fdd936e51e915bdde394e2252418e5763b09a725a8e2b2314e7a06528',
+ 'native_audio_resume:156:38': '0c2a497be2dd97c9f96cc5ba54ed2e34e4fa86fce5793433d172af2e40efa516',
+ 'native_audio_resume:157:24': '9a851a847ff016e8f82f2f39eb1501c37cb64c5eda228f8585de53497252a1ee',
+ 'native_audio_resume:164:47': 'c990868da83a1bd4f401739b4e76924c42c2270464876308a20facb8746d280e',
+ 'native_audio_resume:166:40': 'f3eff848ed3dfdb8efbd8039f42d47539f7e870a2261be599c601fd09e60cbbe',
+ 'native_audio_resume:178:23': 'b98a70357ca6d3c7bcdd29a5529a821c5887cf4bda7d7d93703bdcfe85871635',
+ 'native_audio_resume:185:40': 'e8697f802137516b4c606ef85c9df10cd3a7a5f1c95430186810c3165f4d1e93',
+ 'native_audio_resume:191:28': '63141741bae511542c8384b3a8681e17ba0da76515454a5c30fe0584adb22e30',
+ 'native_audio_resume:194:128': 'a706e2d280a2616d2bf88484177ef347c4b0f631bcf1740ceadaa006d393aace',
+ 'native_audio_resume:194:67': 'e107f7151c18ba96f04cc8dae9c1101f7e5a94a2b146e4f3097426d03c9281bb',
+ 'native_audio_resume:43:37': '59896004aedd103085d6ee6034184d5088ea5bbf1d0832a76e191dd315a1c2c6',
+ 'native_audio_resume:45:35': 'd59e31418b7e2506037f74905d34473a8d9c5eb5c54faec4aaf30cd7f1fedbbe',
+ 'native_audio_resume:67:64': 'e03d523b965ad9e5e3bc9d8398dd65fa512e44febf0ceedd7f3aece33c72ad7c',
+ 'native_cg_global_storage:20:8': 'd63c646ededa9ddb2a48e0741c5b7a1259ef3b608144874218ce2a4997bf18a4',
  'native_cg_global_storage:21:8': 'f2a34cf2403cb3d0f5f9e333f927105d99e59910751c5f259be4270dba1a796d',
  'native_cg_global_storage:22:11': 'e21641cfa9509f91025fc746efdfa47e424157915f061a1cf7cb0cb862686926',
  'native_cg_global_storage:23:13': '85b0107c9ed4745be5ac76124d46b08fb6c4214004a4aafe447c1d73ba64fbc0',
@@ -793,3 +813,5 @@ APPROVED = {'native_cg_global_storage:20:8': 'd63c646ededa9ddb2a48e0741c5b7a1259
  'native_rotation_degrees:43:27': '9e2eb76b92a69a7a35b00764779bf5603516ef9576e229d1a5beb629ed1ca70b',
  'native_rotation_degrees:44:8': '0e082dcac7abe2985db6e9556bb2ea184a76d1ce081c9f9d44f94143d91e0894',
  'native_rotation_degrees:45:27': 'ad9b94f30877a3f8466fd49ca618b79918f0589e5a396cecad525b4f977981e0'}
+
+ACTIVE = tuple(APPROVED)

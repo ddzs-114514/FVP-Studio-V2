@@ -14,7 +14,7 @@ from .performance_compile import jump, sha
 KINDS = {"GuiBGM", "GuiSE", "GuiVoiceLine"}
 
 
-def playback_contract(kinds):
+def playback_contract(kinds, *, voice_backlog_replay=False, voice_current_line_replay=False):
     """Generic exporter only; target binding still decides which kinds exist."""
     return dict(schema="fvp-native-audio-playback/1",
         operations={k: (["play", "keep", "restart", "volume", "stop"] if k == "bgm"
@@ -29,7 +29,8 @@ def playback_contract(kinds):
         volume_duration_zero_policy="target_native_not_envelope_cancel",
         se_loop_ends=["explicit_stop", "native_slot_replacement", "owned_program_end"],
         cross_line_continuity=True, cross_scene_continuity=True,
-        voice_line_playback='voice' in kinds, voice_backlog_replay=False,
+        voice_line_playback='voice' in kinds, voice_backlog_replay='voice' in kinds and voice_backlog_replay,
+        voice_current_line_replay='voice' in kinds and voice_current_line_replay,
         voice_native_wait='voice' in kinds, voice_stop_on_line_advance=True,
         waits_for_audio=False, runtime_verified=False)
 
@@ -89,11 +90,56 @@ class GuiAudioEmitter(GuiCgEmitter):
         self.gui_audio_used = False
         self.gui_voice_used = False
         self.legacy_audio_program = None
+        self.legacy_voice_replay = None
+        self.audio_resume_executable = None
+        self.audio_resume_session = None
+
+    def bind_audio_resume(self, executable, *, checkpoint_test=False):
+        """Supply the actual target EXE and an explicit new-copy test option."""
+        from .gui_audio_checkpoint import bridge_options
+        bridge_options(checkpoint_test)
+        if self.audio_resume_executable is not None or self.audio_resume_session is not None:
+            raise ValueError('当前输出已绑定原剧情音频接口。')
+        self.audio_resume_executable = bytes(executable)
+        self.audio_checkpoint_test = checkpoint_test
 
     def prepare_audio(self, events, resources):
+        if (getattr(self,'audio_resume_executable',None) is not None
+                and self.audio_resume_session is None and any(e['kind'] in KINDS for e in events)):
+            from .gui_legacy_audio import legacy_backend
+            from .gui_story_program import StoryVariableBank
+            from .native_audio_resume_session import NativeAudioResumeSession
+            bank=getattr(self,'story_bank',None)
+            if bank is None:
+                bank=self.story_bank=StoryVariableBank(self,{})
+                bank.initialize()
+            extra=[]
+            if any(e['kind']=='GuiVoiceLine' for e in events):
+                from .gui_voice_program import stop_helper, CONTRACT
+                stop_helper(self)
+                extra=self.helpers[('gui_voice_stop',CONTRACT)]['clears']
+            self.audio_resume_session=NativeAudioResumeSession(
+                self.source,self.document,self.output,bank,
+                legacy_backend(self.source,self.clean),self.audio_resume_executable,
+                extra_globals=extra,
+                **(dict(checkpoint_test=True) if getattr(self,'audio_checkpoint_test',False) else {}))
         if self.legacy_audio_program is None and any(e['kind'] in {'GuiBGM', 'GuiSE'} for e in events):
             from .gui_legacy_audio import LegacyAudioProgram
             self.legacy_audio_program = LegacyAudioProgram(self, events, resources)
+        if getattr(self, 'legacy_voice_replay', None) is None and any(e['kind'] == 'GuiVoiceLine' for e in events):
+            from .gui_legacy_voice_replay import LegacyVoiceReplay
+            self.legacy_voice_replay = LegacyVoiceReplay(self, events, resources)
+
+    def finalize_audio_resume(self, payload):
+        replay = getattr(self, 'legacy_voice_replay', None)
+        if replay is not None:
+            payload = replay.finalize(payload)
+        if self.audio_resume_session is None:
+            return payload
+        payload=self.audio_resume_session.finalize(payload)
+        if self.legacy_audio_program is not None:
+            self.legacy_audio_program.link_resume(self.audio_resume_session.report())
+        return payload
 
     def compile(self, program, resources, *, finalize_jumps=True):
         self.prepare_audio(program['events'], resources)
@@ -162,10 +208,18 @@ class GuiAudioEmitter(GuiCgEmitter):
         return True
 
     def resume_original(self):
-        if self.gui_voice_used:
+        # Paired restoration unloads only slots actually claimed. Each voiced
+        # line already stops its own playback after the native wait; an extra
+        # unconditional stop here would touch voice in an unselected branch.
+        if self.gui_voice_used and self.audio_resume_session is None:
             from .gui_voice_program import stop_helper
             stop_helper(self)
             self.output.extend(self.native("gui_voice_stop"))
         if self.legacy_audio_program is not None:
-            self.legacy_audio_program.finish()
+            self.legacy_audio_program.finish(restore_original=self.audio_resume_session is None)
+        replay = getattr(self, 'legacy_voice_replay', None)
+        if replay is not None:
+            replay.restore()
+        if self.audio_resume_session is not None:
+            self.audio_resume_session.restore()
         return super().resume_original()

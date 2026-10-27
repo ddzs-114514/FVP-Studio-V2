@@ -5,7 +5,7 @@ import ast
 import hashlib
 import json
 from pathlib import Path
-from .engine_pattern_manifest import APPROVED
+from .engine_pattern_manifest import APPROVED, ACTIVE
 from .engine_patterns import SCHEMA, validate_patterns
 from .local_binding import load_binding, safe_local, validate_binding, SCHEMA as HOSHI_SCHEMA
 
@@ -17,7 +17,10 @@ def collect_patterns(source_dir):
     """
     root = safe_local(source_dir)
     found = {}
-    for module in sorted({key.split(":")[0] for key in APPROVED}):
+    by_digest = {}
+    for key in ACTIVE:
+        by_digest.setdefault((key.split(":")[0], APPROVED[key]), []).append(key)
+    for module in sorted({key.split(":")[0] for key in ACTIVE}):
         path = safe_local(root / (module + ".py"), file=True)
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
             data = None
@@ -30,12 +33,11 @@ def collect_patterns(source_dir):
                 data = bytes.fromhex(node.args[0].value)
             if data is None:
                 continue
-            key = f"{module}:{node.lineno}:{node.col_offset}"
-            if key in APPROVED:
-                if hashlib.sha256(data).hexdigest() != APPROVED[key]:
-                    raise ValueError("输入签名与既有审核算法不一致，拒绝导入")
+            # Formatting/line movement is not identity. Exact bytes still must
+            # match an audited digest in the same module; never execute input.
+            for key in by_digest.get((module, hashlib.sha256(data).hexdigest()), ()):
                 found[key] = data.hex()
-    if set(found) != set(APPROVED):
+    if set(found) != set(ACTIVE):
         raise ValueError("本机输入缺少审核过的识别签名；不生成不完整替代规则")
     result = {"schema": SCHEMA, "patterns": found}
     validate_patterns(result)

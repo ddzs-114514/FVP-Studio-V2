@@ -1,7 +1,7 @@
 """Registered, read-only movie assets for intro/OP/ED authoring.
 
-No native movie emitter is claimed here: modern Movie/MovieState/MovieStop
-and legacy MoviePlay have different ABIs, and original EDs may be graphics.
+This read-only catalog does not grant native export: target-bound movie
+output has a separate capability. Legacy MoviePlay and image EDs differ.
 Cataloguing a file is not verification that an engine can play that file.
 """
 from __future__ import annotations
@@ -70,7 +70,7 @@ class GuiCinematics:
         rows = [r for r in self._entries(source) if query.casefold() in r['resource'].casefold()]
         return dict(ok=True, schema=SCHEMA, source=sid, total=len(rows), offset=offset, limit=limit,
             items=rows[offset:offset+limit], read_only=True, native_export=False,
-            notice='影片目录已接入；原作影片调用与 ED 字幕的游戏输出尚未接通。')
+            notice='影片目录仅供只读选取；游戏输出以目标能力和场景导出结果为准，ED 图片字幕尚未接入。')
 
     def resolve(self, sid, resource, expected=None):
         source = self.source(sid)

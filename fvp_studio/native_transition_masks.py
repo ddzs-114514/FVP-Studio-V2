@@ -149,10 +149,19 @@ class NativeTransitionMasks:
             if file.resolve().parent != self.root or fingerprint(file) != stamp:
                 raise ValueError("原作遮罩档案已经变化，请重新选择输出游戏。")
 
-    def prepare(self, output, *, append_offset=None):
+    def prepare(self, output, *, append_offset=None, nonblocking=False):
+        if type(nonblocking) is not bool:
+            raise ValueError('遮罩等待策略须为布尔值。')
+        # Ordinary parallel beats own their old-effect wait before resource
+        # preparation and their final wait after all channels have launched.
+        # Retained callees are proven Dissolve-only by _expand above.
+        removed = set(self.removed_syscalls)
+        if nonblocking:
+            removed.update(i.offset for i in self.span.instructions if i.mnemonic == 'syscall'
+                and self.screen.analysis.header.syscalls[i.operands['id']].name == 'DissolveWait')
         return self.screen._prepare_copy(output, self.span, self.retained,
             {"Dissolve", "DissolveWait"}, self.removed_alpha, append_offset=append_offset,
-            removed_syscalls=self.removed_syscalls)
+            removed_syscalls=removed)
 
     def code(self, address, mask, duration):
         self.check_unchanged()

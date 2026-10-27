@@ -161,6 +161,9 @@ def emit_line(emitter, event, resources):
         narration=fields["speaker_mode"] == "narration", binding=identity)
     for glob, value in ((276,binding["native_id"]),(277,None),(278,fields["volume"])):
         emitter.output.extend(args([value]) + b"\x15" + struct.pack("<H", glob))
+    replay = getattr(emitter, 'legacy_voice_replay', None)
+    if replay is not None:
+        emitter.output.extend(replay.program.before_print(event))
     emitter.speech = dict(name=fields["display_name"], text=fields["text"], voice_sha256=fields["sha256"],
         history_key=history, speaker_identity=bool(identity))
     emitter.output.extend(args([fields["text"],None,None,None]) + call(target))

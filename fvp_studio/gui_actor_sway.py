@@ -6,10 +6,11 @@ Only the paired, target-bound native exporter may lower these events.
 from copy import deepcopy
 import math
 import re
+from .gui_actor_nod import KIND as NOD, values as nod_values
 
 START = 'GuiActorSwayStart'
 STOP = 'GuiActorSwayStop'
-KINDS = {START, STOP}
+KINDS = {START, STOP, NOD}
 ID = re.compile(r'[A-Za-z0-9_-]{1,160}\Z')
 
 
@@ -103,6 +104,8 @@ def plan_tracks(beats):
 
 
 def event_values(kind, fields):
+    if kind == NOD:
+        return nod_values(fields)
     allowed = {'actor', 'loop_id'} | ({'amplitude', 'direction', 'period_ms', 'curve'} if kind == START else set())
     # Old internal R events omitted axis. Keep them readable, while every new
     # event explicitly identifies its units (native R versus editor Y pixels).
@@ -138,6 +141,10 @@ def validate_events(events):
         if kind in KINDS:
             e = event_values(kind, {k: v for k, v in event.items() if k != 'kind'})
             a = e['actor']
+            if kind == NOD:
+                if a in active:
+                    raise ValueError('同一角色请先停止持续摇摆，再点头。')
+                continue
             if kind == START:
                 if a in active:
                     raise ValueError('同角色摇摆重叠。')

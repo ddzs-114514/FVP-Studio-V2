@@ -1,0 +1,54 @@
+FVP Studio V2 0.2.3 — shared backend update, 2026-10-28
+
+Completed source-level additions
+- Ordinary scene mask transitions: resolve masks from the actual output target,
+  prepare resources before reveal, launch one stage transition alongside motion,
+  expression, camera, blur and supported body swaps, then wait at the beat boundary.
+- CG load/swap/exit/framing share one explicit transition owner. Supported methods
+  are filtered by the target; ordinary portrait/CG overlay remains unsupported.
+- Single portrait nod: new defaults amp=75, unit=script, timing=original,
+  duration_ms=450, curve=3. Convert through the bound target's XY wrapper.
+  Sample V3DMotionTest once at worker start: two equal 225/250ms legs,
+  450/500ms total. This is a preset from one observed original action,
+  not proof that every game uses it. Old amp-only projects retain pixel/fixed timing.
+- Same-beat motion companions and parallel stage preparation retain one owner
+  per object/channel, dialogue guards and chapter/choice relocation boundaries.
+- Opening CG setup and sequential OP-only movie scenes retain target-bound
+  capability checks, first-entry/last-exit transitions, native waits and cleanup.
+  Registered-source movie imports freeze identity/hash, require the output target's
+  native extension and copy only into a new output candidate without overwrite.
+  Arbitrary paths, transcoding, mixed ordinary/movie beats and ED remain unsupported;
+  matching extensions do not prove decoder compatibility.
+- Native current-line/backlog imported-voice replay share collision-safe numbering
+  across both voice archives and new allocations. Original entries keep fallback.
+- Shared same-process audio ownership retains existing native decoder/buffer
+  objects when returning to original story. It is not cross-process save restoration.
+
+Publication boundaries
+This is a backend-only update. The previously published sanitized web GUI is
+unchanged. New mask/CG/nod backend contracts are ready for later frontend wiring;
+new controls, desktop candidates and unfinished frontend drafts are NOT included.
+Capability contracts describe source support, not a currently reloaded service.
+
+Unfinished cross-process audio checkpoint/save hooks, C/H runtime and compiled
+payload are NOT distributed. Shared endpoints keep a small fail-closed boundary:
+default false; an explicit experimental request is rejected, never silently
+ignored or treated as a successful export. production_export_enabled=false,
+runtime_verified=false and save_load_verified=false.
+
+Private engine-recognition bytes remain local. Only exact identity hashes are
+public; missing/mismatching private configuration refuses native output. Pattern
+collection matches exact audited digests within the same module, not line numbers.
+No game resources, executable data, original dialogue/call-table exports, user
+projects, source registrations, machine paths, private bindings, QA or local
+release evidence are included. Package adapters, empty preview, new-only test-copy
+guards and GPL-3.0-or-later are retained. No new BAT launcher is included.
+
+Verification layers
+Focused synthetic tests check mask ownership/order, CG transitions, nod defaults
+and legacy compatibility. Portable and fail-closed checks exercise only synthetic
+temporary data. AST/hash audits compare the release with frozen source plus the
+documented portability and experiment-exclusion adaptations. GUI model checks do
+not imply full browser visual acceptance. No game is opened, copied or launched.
+Runtime, listening, save/load and broad game compatibility remain unverified.
+The update neither reloads a development service nor changes existing exports.
